@@ -9,8 +9,9 @@
 //! effects are run from a cleared state over a pre-roll of earlier audio and only the block's
 //! tail is kept — so preview playback and export produce identical samples.
 //!
-//! Time-stretched layers are resampled nearest-sample; reversed (negative stretch) layers are
-//! silent for now.
+//! Time-stretched and time-remapped audio is linearly resampled. Time Remap uses the same
+//! source-time evaluation as video, at audio sample resolution; it does not preserve pitch.
+//! Reversed (negative stretch) layers are silent for now.
 
 use effectcraft_effects::Params;
 use effectcraft_effects::audio_fx;
@@ -137,6 +138,10 @@ impl MixEnv<'_> {
         if a >= b {
             return out;
         }
+        if l.props.get("timeRemap").is_some() {
+            self.remapped_raw(l, i0, a, b, &mut out);
+            return out;
+        }
         let m = b - a;
         let speed = 100.0 / l.stretch;
         let src_n = ((m as f64 * speed).ceil() as usize).max(1);
@@ -171,6 +176,52 @@ impl MixEnv<'_> {
             out[(a + i) * 2 + 1] = buf[j * 2 + 1] + (buf[k * 2 + 1] - buf[j * 2 + 1]) * f;
         }
         out
+    }
+
+    /// Fetch bounded source pages, rather than decoding once per output sample or allocating
+    /// the entire span between arbitrarily distant remap keys. Page alignment is independent
+    /// of the caller's buffer size, including the interpolation sample at each page boundary.
+    fn remapped_raw(&self, l: &Layer, i0: i64, a: usize, b: usize, out: &mut [f32]) {
+        const PAGE: i64 = 4096;
+        let mut cached_page = None;
+        let mut buf = Vec::new();
+        for i in a..b {
+            let Ok(offset) = i64::try_from(i) else { break };
+            let Some(index) = i0.checked_add(offset) else { break };
+            let source = self.ctx(sample_tick(index, self.rate)).source_time(l);
+            let numerator = i128::from(source.0) * i128::from(self.rate);
+            let denominator = i128::from(TICKS_PER_SECOND);
+            let Ok(sample) = i64::try_from(numerator.div_euclid(denominator)) else { continue };
+            let Some(page) = sample.div_euclid(PAGE).checked_mul(PAGE) else { continue };
+            if cached_page != Some(page) {
+                let start = sample_tick(page, self.rate);
+                let frames = PAGE as usize + 1;
+                buf = match &l.source {
+                    LayerSource::Footage { item } => match self.project.item(*item).map(|i| &i.kind) {
+                        Some(ItemKind::Footage(f)) if f.has_audio => self.footage.audio(*item, f, start, frames, self.rate).unwrap_or_default(),
+                        _ => return,
+                    },
+                    LayerSource::Comp { item } => {
+                        if self.project.comp_contains(*item, self.comp_id) {
+                            return;
+                        }
+                        let mut sub = vec![0.0; frames * 2];
+                        mix_into(self.project, self.footage, self.expr, *item, start, self.rate, &mut sub, 1.0, 1.0, self.depth + 1);
+                        sub
+                    }
+                    _ => return,
+                };
+                cached_page = Some(page);
+            }
+            let j = (sample.rem_euclid(PAGE) as usize) * 2;
+            let fraction = (numerator.rem_euclid(denominator) as f64 / denominator as f64) as f32;
+            let Some(pair) = out.get_mut(i.saturating_mul(2)..i.saturating_mul(2).saturating_add(2)) else { break };
+            for (channel, output) in pair.iter_mut().enumerate() {
+                let x = buf.get(j + channel).copied().unwrap_or(0.0);
+                let y = buf.get(j + 2 + channel).copied().unwrap_or(0.0);
+                *output = x + (y - x) * fraction;
+            }
+        }
     }
 
     /// Effect parameters at comp time `t`.

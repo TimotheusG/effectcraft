@@ -91,6 +91,79 @@ fn ramp(t: f64) -> (f32, f32) {
     (t as f32, -(t as f32))
 }
 
+fn remap(p: &mut Project, cid: ItemId, points: &[(f64, f64)]) {
+    let mut next = p.next_id;
+    let mut prop = Ids(&mut next).prop("timeRemap", "Time Remap", Value::Scalar(0.0));
+    prop.keys = points.iter().map(|&(t, v)| effectcraft_keyframe::Keyframe::new(Tick::from_seconds_f64(t), Value::Scalar(v))).collect();
+    p.next_id = next;
+    p.comp_mut(cid).unwrap().layers[0].props.children.push(prop.into());
+}
+
+#[test]
+fn audio_time_remap_follows_offset_and_speed_changes_across_blocks() {
+    let (mut p, cid) = comp_with(None, &[], false);
+    remap(&mut p, cid, &[(0.0, 0.5), (0.25, 0.75), (0.75, 1.0), (1.0, 1.25)]);
+    let whole = mix(&p, &Signal(ramp), cid, 0.0, SR as usize);
+    for i in 0..SR as usize {
+        let t = i as f64 / SR as f64;
+        let expected = if t < 0.25 {
+            0.5 + t
+        } else if t < 0.75 {
+            0.75 + (t - 0.25) * 0.5
+        } else {
+            1.0 + t - 0.75
+        };
+        assert!((whole[i * 2] as f64 - expected).abs() < 1e-5, "sample {i}: {} != {expected}", whole[i * 2]);
+        assert!((whole[i * 2 + 1] as f64 + expected).abs() < 1e-5);
+    }
+    let mut blocked = Vec::new();
+    for first in (0..SR as usize).step_by(137) {
+        blocked.extend(mix(&p, &Signal(ramp), cid, first as f64 / SR as f64, 137.min(SR as usize - first)));
+    }
+    assert_eq!(whole, blocked, "preview and export block sizes must not change the audio");
+}
+
+#[test]
+fn audio_time_remap_handles_reverse_source_motion_and_layer_bounds() {
+    let (mut p, cid) = comp_with(None, &[], false);
+    remap(&mut p, cid, &[(0.0, 1.5), (1.0, 0.5)]);
+    let samples = mix(&p, &Signal(ramp), cid, 0.5, SR as usize);
+    for i in 0..SR as usize {
+        let expected = if i < SR as usize / 2 { 1.0 - i as f64 / SR as f64 } else { 0.0 };
+        assert!((samples[i * 2] as f64 - expected).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn audio_time_remap_evaluates_keys_in_stretched_layer_time() {
+    let (mut p, cid) = comp_with(None, &[], false);
+    remap(&mut p, cid, &[(0.0, 0.5), (1.0, 1.5)]);
+    let l = &mut p.comp_mut(cid).unwrap().layers[0];
+    l.start_time = Tick::from_seconds_f64(0.25);
+    l.in_point = l.start_time;
+    l.out_point = Tick::from_seconds_f64(2.0);
+    l.stretch = 200.0;
+    let samples = mix(&p, &Signal(ramp), cid, 0.75, 200);
+    for i in 0..200 {
+        let expected = 0.75 + i as f64 / SR as f64 * 0.5;
+        assert!((samples[i * 2] as f64 - expected).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn audio_time_remap_of_precomp_uses_nested_source_audio() {
+    let (mut p, inner) = comp_with(None, &[], false);
+    let mut outer = Comp::new(64, 64, FrameRate::new(25, 1), Tick::from_seconds_f64(1.0));
+    outer.layers.push(build::layer(&mut p, &outer, "nested", LayerSource::Comp { item: inner }, (64, 64), None));
+    let cid = p.add_item("Outer", effectcraft_color::Label::Sandstone, None, ItemKind::Comp(outer.into()));
+    remap(&mut p, cid, &[(0.0, 0.25), (1.0, 0.75)]);
+    let samples = mix(&p, &Signal(ramp), cid, 0.0, SR as usize);
+    for i in 0..SR as usize {
+        let expected = 0.25 + i as f64 / SR as f64 * 0.5;
+        assert!((samples[i * 2] as f64 - expected).abs() < 1e-5);
+    }
+}
+
 fn rms(m: &[f32]) -> f32 {
     (m.iter().map(|v| v * v).sum::<f32>() / m.len() as f32).sqrt()
 }
