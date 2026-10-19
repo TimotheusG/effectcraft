@@ -68,7 +68,8 @@ mod imp {
         sock: Mutex<Sock>,
         /// A second handle on a stream, so `close` can wake a blocked read.
         wake: Option<TcpStream>,
-        /// Writes poll this flag because shutdown alone may not interrupt a Windows send.
+        /// Closed or unusable after a mode error. Writes poll it because Windows sends may not
+        /// be interrupted by shutdown alone; queued operations recheck it after locking.
         closed: AtomicBool,
     }
 
@@ -164,16 +165,26 @@ mod imp {
         Ok(())
     }
 
+    /// A failed mode transition leaves the stream unusable; reject queued operations and wake I/O.
+    fn change_mode(s: &TcpStream, entry: &Entry, nonblocking: bool, mode: &impl Fn(&TcpStream, bool) -> std::io::Result<()>) -> std::io::Result<()> {
+        mode(s, nonblocking).map_err(|e| {
+            entry.closed.store(true, Ordering::Release);
+            let _ = s.shutdown(Shutdown::Both);
+            let action = if nonblocking { "enable nonblocking mode" } else { "restore blocking mode" };
+            std::io::Error::other(format!("socket is unusable: cannot {action}: {e}"))
+        })
+    }
+
     /// Write with one deadline and an explicit close signal. On Windows, shutdown alone does
     /// not reliably interrupt a blocking send, so never leave a send blocked inside the OS.
-    /// The caller holds this socket's lock; restore blocking mode before another operation.
-    fn write(s: &mut TcpStream, data: &[u8], limit: Duration, closed: &AtomicBool) -> std::io::Result<()> {
-        s.set_nonblocking(true)?;
+    /// The caller holds this socket's lock; restore blocking mode or retire the connection.
+    fn write(s: &mut TcpStream, data: &[u8], limit: Duration, entry: &Entry, mode: &impl Fn(&TcpStream, bool) -> std::io::Result<()>) -> std::io::Result<()> {
+        change_mode(s, entry, true, mode)?;
         let end = Instant::now() + limit;
         let result = (|| {
             let mut pending = data;
             while !pending.is_empty() {
-                if closed.load(Ordering::Acquire) {
+                if entry.closed.load(Ordering::Acquire) {
                     return Err(std::io::Error::new(ErrorKind::ConnectionAborted, "the socket was closed"));
                 }
                 let left = end.saturating_duration_since(Instant::now());
@@ -190,12 +201,20 @@ mod imp {
             }
             Ok(())
         })();
-        let restored = s.set_nonblocking(false);
-        result.and(restored)
+        match (result, change_mode(s, entry, false, mode)) {
+            (Err(write), Err(restore)) => Err(std::io::Error::other(format!("{restore}; write also failed: {write}"))),
+            (result, Ok(())) => result,
+            (Ok(()), Err(restore)) => Err(restore),
+        }
     }
 
     /// Dispatch an authorized operation without holding the socket table during I/O.
     pub(super) fn run(op: &str, id: u32, p: &J) -> J {
+        run_with_mode(op, id, p, TcpStream::set_nonblocking)
+    }
+
+    /// Dispatch with a mode setter so exceptional OS failures can be injected per operation.
+    pub(super) fn run_with_mode(op: &str, id: u32, p: &J, mode: impl Fn(&TcpStream, bool) -> std::io::Result<()>) -> J {
         let utf8 = p.get("encoding").and_then(J::as_str).is_some_and(|e| e.eq_ignore_ascii_case("utf-8") || e.eq_ignore_ascii_case("utf8"));
         match op {
             "open" => {
@@ -243,6 +262,15 @@ mod imp {
                     };
                 };
                 let mut sock = entry.sock.lock().unwrap_or_else(|e| e.into_inner());
+                // Recheck after locking: close or a failed mode transition may have retired it
+                // while this caller waited with an Arc obtained from the table.
+                if entry.closed.load(Ordering::Acquire) {
+                    return match op {
+                        "connected" => json!({"value": false}),
+                        "eof" => json!({"value": true}),
+                        _ => err("the socket is closed or unusable"),
+                    };
+                }
                 match (op, &mut *sock) {
                     ("poll", Sock::Listener(l)) => match l.accept() {
                         Ok((s, peer)) => {
@@ -257,14 +285,18 @@ mod imp {
                     ("connected", Sock::Stream { s, buf, eof }) => {
                         if !*eof && buf.is_empty() {
                             // Peek without blocking to notice a closed peer.
-                            let _ = s.set_nonblocking(true);
+                            if let Err(e) = change_mode(s, &entry, true, &mode) {
+                                return err(e);
+                            }
                             let mut b = [0u8; 1];
                             match s.peek(&mut b) {
                                 Ok(0) => *eof = true,
                                 Err(e) if e.kind() != ErrorKind::WouldBlock => *eof = true,
                                 _ => {}
                             }
-                            let _ = s.set_nonblocking(false);
+                            if let Err(e) = change_mode(s, &entry, false, &mode) {
+                                return err(e);
+                            }
                         }
                         json!({"value": !(*eof && buf.is_empty())})
                     }
@@ -311,7 +343,7 @@ mod imp {
                         // instead of blocking the script for good (#1248).
                         let limit = timeout(p).max(Duration::from_millis(1));
                         let data = p.get("data").and_then(J::as_str).unwrap_or("");
-                        match write(s, &encode(data, utf8), limit, &entry.closed) {
+                        match write(s, &encode(data, utf8), limit, &entry, &mode) {
                             Ok(()) => json!({"ok": true}),
                             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => err(format!(
                                 "write timed out after {} s: the other side isn't reading (some of the data may have been sent)",
@@ -429,6 +461,46 @@ mod tests {
         let r = blocked.recv_timeout(Duration::from_secs(5)).expect("A's write ended when A was closed");
         assert!(r.get("error").is_some(), "{r}");
         run("close", b, &J::Null);
+    }
+
+    /// Failed mode changes retire the stream; subsequent I/O fails instead of using it.
+    #[test]
+    fn mode_restoration_failure_retires_streams() {
+        for (op, fail_nonblocking) in [("write", false), ("connected", false), ("write", true), ("connected", true)] {
+            let (host, _keep) = stalled_peer();
+            let id = open(&host);
+            let result = super::imp::run_with_mode(op, id, &json!({"data": "hello"}), |s, nonblocking| {
+                if nonblocking == fail_nonblocking { Err(std::io::Error::other("injected mode failure")) } else { s.set_nonblocking(nonblocking) }
+            });
+            assert!(result["error"].as_str().is_some_and(|e| e.contains("injected mode failure")), "{op}: {result}");
+            assert_eq!(run("connected", id, &J::Null)["value"], false, "{op}: broken socket remains connected");
+            assert_eq!(run("eof", id, &J::Null)["value"], true);
+            for operation in ["read", "readln", "write"] {
+                let r = run(operation, id, &json!({"count": 1, "timeout": 0.01, "data": "x"}));
+                assert!(r.get("error").is_some(), "{operation} must reject the unusable stream: {r}");
+            }
+            run("close", id, &J::Null);
+            run("close", id, &J::Null);
+        }
+    }
+
+    /// A preceding write error cannot hide the failure that makes the stream unusable.
+    #[test]
+    fn restoration_failure_preserves_the_write_error_too() {
+        let (host, _keep) = stalled_peer();
+        let id = open(&host);
+        let result = super::imp::run_with_mode("write", id, &json!({"data": "hello"}), |s, nonblocking| {
+            if nonblocking {
+                s.set_nonblocking(true)?;
+                s.shutdown(std::net::Shutdown::Write)
+            } else {
+                Err(std::io::Error::other("injected restore failure"))
+            }
+        });
+        let error = result["error"].as_str().unwrap();
+        assert!(error.contains("injected restore failure") && error.contains("write also failed"), "{error}");
+        assert_eq!(run("connected", id, &J::Null)["value"], false);
+        run("close", id, &J::Null);
     }
 
     /// Both outgoing and accepted sockets deliver complete data, then return to blocking reads.
