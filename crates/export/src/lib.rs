@@ -26,6 +26,8 @@
 //! not across an image sequence; complete files already published before a rename failure remain.
 //! Sinks still receive each file when it finishes encoding. Staging needs space alongside any old
 //! output until publication, and a process crash may leave temporary files for manual cleanup.
+//! On Unix, staging holds media owner-only. Publication retains the destination's access-mode
+//! bits (also respecting tighter bits observed before publication); new files use the umask.
 //!
 //! Frames are rendered in parallel batches (rayon; one batch ≈ one frame per core) and handed to
 //! the encoder in order. They share the job's layer cache, as viewer frames share the viewer's:
