@@ -324,7 +324,13 @@ fn mix_block(
     mix: u32,
     stop: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<f32>, effectcraft_engine::render::audio::AudioError> {
-    let control = effectcraft_engine::render::audio::MixControl { cancel: stop.cloned(), ..Default::default() };
+    // Scrubbing runs on the UI thread: one snippet must not multiply per-expression timeouts.
+    let control = effectcraft_engine::render::audio::MixControl {
+        cancel: stop.cloned(),
+        max_duration: stop.is_none().then_some(std::time::Duration::from_millis(50)),
+        max_expression_yields: stop.is_none().then_some(32),
+        ..Default::default()
+    };
     let render = |frames: usize, at: u32| {
         effectcraft_engine::render::audio::mix_comp_with_control(&src.project, src.footage.as_ref(), src.expr.as_deref(), comp, t, frames, at, &control)
     };

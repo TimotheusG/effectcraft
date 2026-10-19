@@ -133,3 +133,48 @@ fn cancellation_interrupts_running_javascript_and_does_not_poison_next_mix() {
     completion.recv_timeout(std::time::Duration::from_secs(3)).expect("cancellation must interrupt the script, not wait for every sample");
     worker.join().unwrap();
 }
+
+/// A runtime resource limit aborts the mix instead of retrying the same script per sample.
+#[test]
+fn expression_resource_limits_abort_audio_and_recover() {
+    let (p, cid) = workload::project(1, 0, Some("for (;;) {}"));
+    let source = workload::Source::default();
+    assert_eq!(mix_comp(&p, &source, Some(&Expressions), cid, Tick::ZERO, 2, 48000), Err(AudioError::WorkLimit));
+    assert_eq!(source.reads.load(Ordering::Relaxed), 0);
+    let (p, cid) = workload::project(1, 0, Some("Math.sin(time)"));
+    assert!(mix_comp(&p, &source, Some(&Expressions), cid, Tick::ZERO, 32, 48000).is_ok());
+}
+
+/// One deadline reaches a running script; nested layers share the same yield allowance.
+#[test]
+fn audio_deadline_and_yield_allowance_are_cumulative() {
+    for depth in [0, 2] {
+        let (p, cid) = workload::project(4, depth, Some("function g() { for(var i=0;i<900000;i++) {} } for(var k=0;k<900000;k++) g()"));
+        let source = workload::Source::default();
+        for control in [
+            MixControl { max_duration: Some(std::time::Duration::from_millis(50)), max_expression_yields: Some(usize::MAX), ..Default::default() },
+            MixControl { max_duration: Some(std::time::Duration::from_secs(30)), max_expression_yields: Some(2), ..Default::default() },
+        ] {
+            let start = std::time::Instant::now();
+            assert_eq!(mix_comp_with_control(&p, &source, Some(&Expressions), cid, Tick::ZERO, 1600, 48000, &control), Err(AudioError::WorkLimit));
+            assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        }
+    }
+    // Two individually small evaluations together exhaust the same allowance, rather than each
+    // receiving a fresh budget. A deterministic host makes this independent of machine speed.
+    struct Yielding;
+    impl ExprHost for Yielding {
+        fn eval(&self, _: &EvalCtx, _: &Layer, _: &Property, v: &Value) -> Result<Value, String> {
+            Ok(v.clone())
+        }
+        fn eval_audio(&self, _: &EvalCtx, _: &Layer, _: &Property, v: &Value, c: &effectcraft_render::audio::AudioEvalControl) -> Result<Value, String> {
+            c.yielded();
+            Ok(v.clone())
+        }
+    }
+    let (p, cid) = workload::project(4, 1, Some("time"));
+    let control = MixControl { max_expression_yields: Some(2), ..Default::default() };
+    assert_eq!(mix_comp_with_control(&p, &workload::Source::default(), Some(&Yielding), cid, Tick::ZERO, 10, 48000, &control), Err(AudioError::WorkLimit));
+    let (p, cid) = workload::project(1, 0, Some("Math.sin(time)"));
+    assert!(mix_comp(&p, &workload::Source::default(), Some(&Expressions), cid, Tick::ZERO, 32, 48000).is_ok());
+}

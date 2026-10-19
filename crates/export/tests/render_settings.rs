@@ -40,10 +40,12 @@ fn project(rate: FrameRate, extra: impl FnOnce(&mut Project, &mut Comp)) -> (Pro
 
 type Files = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
+/// Select an exact export span without changing the project's timing.
 fn custom(start: f64, end: f64) -> RenderSettings {
     RenderSettings { time_span: TimeSpan::Custom { start: Tick::from_seconds_f64(start), end: Tick::from_seconds_f64(end) }, ..Default::default() }
 }
 
+/// Collect finished in-memory outputs alongside the export result.
 fn run_with(p: &Project, cid: ItemId, s: &RenderSettings, om: &OutputModule, path: &str, options: JobOptions, cancel: bool) -> (Result<Report, String>, Files) {
     run_on(p, cid, s, om, path, options, None, cancel)
 }
@@ -494,4 +496,67 @@ fn audio_mix_failures_abort_export() {
     });
     let (result, _) = run_with(&p, cid, &custom(0.0, 0.5), &om, "/limited.wav", JobOptions::default(), false);
     assert!(result.unwrap_err().contains("audio mixing exceeded its work limit"));
+}
+
+/// Valid low-frame-rate movie exports must split large audio requests into bounded mixes.
+#[test]
+fn low_frame_rate_audio_exports_are_not_rejected_by_the_mix_limit() {
+    let (mut p, cid) = project(FrameRate::new(1, 30), |_, _| {});
+    p.comp_mut(cid).unwrap().duration = Tick::from_seconds_f64(30.0);
+    for (format, codec) in
+        [(OutputFormat::Uncompressed, WebmVideoCodec::Vp9), (OutputFormat::WebM, WebmVideoCodec::Vp9), (OutputFormat::WebM, WebmVideoCodec::Av1)]
+    {
+        let mut om = OutputModule::for_format(format);
+        om.webm_codec = codec;
+        om.audio = AudioOutput::On;
+        om.audio_sample_rate = 48000;
+        let (result, files) = run_with(&p, cid, &custom(0.0, 30.0), &om, "/slow.mov", JobOptions::default(), false);
+        assert!(result.is_ok(), "{format:?}/{codec:?}: {result:?}");
+        assert_eq!(files.lock().unwrap().len(), 1);
+    }
+}
+
+/// A failed movie mix must remove its owned output while preserving unrelated files.
+#[test]
+fn audio_failure_removes_partial_movie_output() {
+    let (p, cid) = project(FrameRate::new(25, 1), |p, c| {
+        let id = p.add_item("audio", Label::SeaFoam, None, ItemKind::Footage(effectcraft_project::Footage { has_audio: true, ..Default::default() }));
+        let mut l = build::layer(p, c, "audio", LayerSource::Footage { item: id }, (0, 0), None);
+        l.stretch = 0.000001;
+        c.layers.push(l);
+    });
+    let dir = std::env::temp_dir().join(format!("effectcraft-audio-failure-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let decoy = dir.join("keep.mov");
+    std::fs::write(&decoy, b"keep").unwrap();
+    for (i, (format, codec)) in
+        [(OutputFormat::Uncompressed, WebmVideoCodec::Vp9), (OutputFormat::WebM, WebmVideoCodec::Vp9), (OutputFormat::WebM, WebmVideoCodec::Av1)]
+            .into_iter()
+            .enumerate()
+    {
+        let path = dir.join(format!("partial-{i}.mov"));
+        let mut om = OutputModule::for_format(format);
+        om.webm_codec = codec;
+        om.audio = AudioOutput::On;
+        let result = export(
+            &Job {
+                project: &p,
+                footage: &NoFootage,
+                expr: None,
+                accel: None,
+                comp: cid,
+                settings: &custom(0.0, 0.04),
+                output: &om,
+                path: path.to_str().unwrap(),
+                sink: None,
+                options: JobOptions::default(),
+                nested_switches: true,
+            },
+            &mut |_| true,
+        );
+        assert!(result.unwrap_err().to_string().contains("work limit"));
+        assert!(!path.exists(), "failed export left {}", path.display());
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"keep");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

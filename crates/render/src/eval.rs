@@ -18,14 +18,7 @@ pub trait ExprHost: Send + Sync {
         None
     }
     /// Evaluate one audio sample, allowing the production runtime to interrupt long scripts.
-    fn eval_audio(
-        &self,
-        ctx: &EvalCtx,
-        layer: &Layer,
-        prop: &Property,
-        value: &Value,
-        _cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ) -> Result<Value, String> {
+    fn eval_audio(&self, ctx: &EvalCtx, layer: &Layer, prop: &Property, value: &Value, _control: &crate::audio::AudioEvalControl) -> Result<Value, String> {
         self.eval(ctx, layer, prop, value)
     }
     /// Evaluate a text Expression Selector's Amount expression (on `prop`) for one unit:

@@ -60,10 +60,63 @@ pub struct MixControl {
     /// Override the default allowance of 1024 source/sample operations per output frame plus
     /// 65536 for page overhead. Individual allocations are also capped at 1048576 stereo frames.
     pub max_work: Option<usize>,
+    /// Native wall-clock allowance for the whole mix (five seconds by default).
+    pub max_duration: Option<std::time::Duration>,
+    /// Shared JavaScript yield allowance (1024 yields of up to 20,000 instructions by default).
+    pub max_expression_yields: Option<usize>,
+}
+
+/// Shared interruption state for every expression in one mix, including nested evaluations.
+/// Clones share the sticky resource failure and yield allowance; a new sample cannot reset them.
+#[derive(Clone)]
+pub struct AudioEvalControl {
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    remaining: std::rc::Rc<std::cell::Cell<usize>>,
+    failed: std::rc::Rc<std::cell::Cell<bool>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    deadline: Option<std::time::Instant>,
+}
+impl AudioEvalControl {
+    /// Capture the deadline once, before any sample or nested mix starts.
+    fn new(control: &MixControl) -> Self {
+        Self {
+            cancel: control.cancel.clone(),
+            remaining: std::rc::Rc::new(std::cell::Cell::new(control.max_expression_yields.unwrap_or(1024))),
+            failed: std::rc::Rc::new(std::cell::Cell::new(false)),
+            #[cfg(not(target_arch = "wasm32"))]
+            deadline: std::time::Instant::now().checked_add(control.max_duration.unwrap_or(std::time::Duration::from_secs(5))),
+        }
+    }
+    /// Mark a runtime resource limit; ordinary expression errors still use keyframed fallback.
+    pub fn fail(&self) {
+        self.failed.set(true);
+    }
+    /// Whether the shared resource allowance has expired (also used after script completion).
+    pub fn exhausted(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            self.fail();
+        }
+        self.failed.get()
+    }
+    /// Check cancellation and resource limits without charging another instruction chunk.
+    pub fn interrupted(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) || self.exhausted()
+    }
+    /// Charge one budgeted JavaScript yield; this also bounds scripts on clockless WASM builds.
+    pub fn yielded(&self) -> bool {
+        if let Some(left) = self.remaining.get().checked_sub(1) {
+            self.remaining.set(left);
+        } else {
+            self.fail();
+        }
+        self.interrupted()
+    }
 }
 
 struct Budget<'a> {
     control: &'a MixControl,
+    expressions: AudioEvalControl,
     remaining: std::cell::Cell<usize>,
     error: std::cell::Cell<Option<AudioError>>,
 }
@@ -77,7 +130,7 @@ impl Budget<'_> {
             self.error.set(Some(AudioError::Cancelled));
             return false;
         }
-        if frames > 1_048_576 || frames > self.remaining.get() {
+        if self.expressions.exhausted() || frames > 1_048_576 || frames > self.remaining.get() {
             self.error.set(Some(AudioError::WorkLimit));
             return false;
         }
@@ -102,6 +155,7 @@ pub fn mix_comp_with_control(
     let footage: &dyn FootageSource = cancellable.as_ref().map_or(footage, |source| source);
     let budget = Budget {
         control,
+        expressions: AudioEvalControl::new(control),
         remaining: std::cell::Cell::new(control.max_work.unwrap_or(frames.saturating_mul(1024).saturating_add(65536))),
         error: std::cell::Cell::new(None),
     };
@@ -302,21 +356,22 @@ impl MixEnv<'_> {
                 } else {
                     let value = self
                         .expr
-                        .map(|h| h.eval_audio(&self.ctx(time), l, prop, &base, self.budget.control.cancel.as_ref()).unwrap_or_else(|_| base.clone()))
+                        .map(|h| h.eval_audio(&self.ctx(time), l, prop, &base, &self.budget.expressions).unwrap_or_else(|_| base.clone()))
                         .unwrap_or(base);
                     Tick::from_seconds_f64(value.as_f64())
                 }
             } else {
                 let base = prop.value_at(l.layer_time(time));
                 let value = if prop.has_expression() {
-                    self.expr
-                        .map(|h| h.eval_audio(&self.ctx(time), l, prop, &base, self.budget.control.cancel.as_ref()).unwrap_or_else(|_| base.clone()))
-                        .unwrap_or(base)
+                    self.expr.map(|h| h.eval_audio(&self.ctx(time), l, prop, &base, &self.budget.expressions).unwrap_or_else(|_| base.clone())).unwrap_or(base)
                 } else {
                     base
                 };
                 Tick::from_seconds_f64(value.as_f64())
             };
+            if !self.budget.charge(0, self.footage) {
+                return;
+            }
             let numerator = i128::from(source.0) * i128::from(self.rate);
             let denominator = i128::from(TICKS_PER_SECOND);
             let Ok(sample) = i64::try_from(numerator.div_euclid(denominator)) else { continue };

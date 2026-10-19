@@ -193,19 +193,63 @@ fn preview_with_audio_sounds_once_rendering_keeps_up() {
     assert!(h.state().audio.is_some() && fake.0.lock().unwrap().0.is_some(), "the sound started within 2 s, at frame {last} of 900");
 }
 
-/// Mixer failures are visible to the user, and no partial snippet reaches the audio device.
+/// Drive a real Cmd-drag from the current-time indicator, leaving the pointer held for recovery.
+fn begin_scrub(h: &mut Harness<'_, EffectcraftApp>) -> egui::Pos2 {
+    let cti = h.state().auto.find("timeline.cti").unwrap().clone();
+    let from = pos2(cti.rect[0] + cti.rect[2] / 2.0, cti.rect[1] + cti.rect[3] / 2.0);
+    h.event(Event::ModifiersChanged(Modifiers::COMMAND));
+    h.event(Event::PointerMoved(from));
+    h.step();
+    h.event(Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::COMMAND });
+    h.step();
+    let to = from + egui::vec2(40.0, 0.0);
+    h.event(Event::PointerMoved(to));
+    h.step();
+    h.step();
+    to
+}
+
+/// Real scrub gestures report both source-work and script-limit errors, draw the toast, and recover.
 #[test]
 fn scrub_reports_excessive_audio_work() {
-    let fake = Fake::default();
-    let (mut app, cid) = setup(true, &fake);
-    Arc::make_mut(&mut app.session.project).comp_mut(cid).unwrap().layers[0].stretch = 0.000001;
-    app.scrub_audio(cid, Tick::ZERO, 0.0);
-    assert!(app.ui.status.contains("audio mixing exceeded its work limit"));
-    let feed = fake.0.lock().unwrap().0.clone().unwrap();
-    assert_eq!(feed.queued_frames(), 0);
-    assert!(feed.error().is_some());
-    Arc::make_mut(&mut app.session.project).comp_mut(cid).unwrap().layers[0].stretch = 100.0;
-    app.scrub_audio(cid, Tick::from_seconds_f64(0.1), 0.1);
-    assert!(feed.queued_frames() > 0);
-    assert!(feed.error().is_none(), "a later successful mix recovers in the same session");
+    for script in [false, true] {
+        let fake = Fake::default();
+        let (mut app, cid) = setup(true, &fake);
+        if script {
+            app.session.expr = effectcraft_host::session().expr;
+            let p = Arc::make_mut(&mut app.session.project);
+            let mut prop = effectcraft_project::build::Ids(&mut p.next_id).prop("timeRemap", "Time Remap", effectcraft_keyframe::Value::Scalar(0.0));
+            prop.expr = Some(effectcraft_project::Expression {
+                text: "function g() { for (var i=0;i<900000;i++) {} } for (var k=0;k<900000;k++) g()".into(),
+                enabled: true,
+            });
+            p.comp_mut(cid).unwrap().layers[0].props.children.push(prop.into());
+        } else {
+            Arc::make_mut(&mut app.session.project).comp_mut(cid).unwrap().layers[0].stretch = 0.000001;
+        }
+        let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_| app);
+        h.run_steps(3);
+        let start = std::time::Instant::now();
+        let at = begin_scrub(&mut h);
+        assert!(start.elapsed() < std::time::Duration::from_secs(3), "scrub must not retry per-sample timeouts");
+        let error = "audio mixing exceeded its work limit; simplify remapping or nested compositions";
+        assert!(h.state().ui.status.contains(error));
+        assert!(h.output().shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text().contains(error))), "visible error toast");
+        assert!(h.state().session.time() > Tick::ZERO, "the gesture changed the current time");
+        let feed = fake.0.lock().unwrap().0.clone().unwrap();
+        assert_eq!(feed.queued_frames(), 0);
+        assert!(feed.error().is_some());
+        let layer = &mut Arc::make_mut(&mut h.state_mut().session.project).comp_mut(cid).unwrap().layers[0];
+        layer.stretch = 100.0;
+        if let Some(prop) = layer.props.prop_mut("timeRemap") {
+            prop.expr = None;
+        }
+        let to = at + egui::vec2(40.0, 0.0);
+        h.event(Event::PointerMoved(to));
+        h.step();
+        assert!(feed.queued_frames() > 0);
+        assert!(feed.error().is_none(), "a later successful mix recovers in the same session");
+        h.event(Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::COMMAND });
+        h.step();
+    }
 }

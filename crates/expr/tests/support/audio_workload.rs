@@ -19,9 +19,11 @@ pub struct Source {
     pub frames: AtomicUsize,
 }
 impl FootageSource for Source {
+    /// This procedural audio source intentionally supplies no video frames.
     fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
         None
     }
+    /// Generate reproducible stereo samples and account for every source request.
     fn audio(&self, _: ItemId, _: &Footage, start: Tick, frames: usize, rate: u32) -> Option<Vec<f32>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.frames.fetch_add(frames, Ordering::Relaxed);

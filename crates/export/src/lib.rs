@@ -177,9 +177,15 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
     let t0 = Instant::now();
     let cx = Cx::new(job);
     let mut r = export_with(&cx, progress, t0).await;
-    if matches!(r, Err(ExportError::Cancelled)) {
-        cx.remove_cancelled_outputs()?;
-        return r;
+    if r.is_err() {
+        // Writers have dropped before this point, including on Windows. Only paths created by
+        // this job are owned; unrelated files and skipped sequence frames remain untouched.
+        if let Err(cleanup) = cx.remove_failed_outputs() {
+            return Err(ExportError::Io(format!("{}; cleanup failed: {cleanup}", r.as_ref().err().map_or_else(String::new, ToString::to_string))));
+        }
+        if matches!(r, Err(ExportError::Cancelled)) {
+            return r;
+        }
     }
     let log = cx.write_log(&r, t0.elapsed().as_secs_f64());
     if let Ok(rep) = &mut r {

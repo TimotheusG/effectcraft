@@ -31,6 +31,7 @@ impl Node {
     }
 }
 impl AudioExpression for Node {
+    /// Evaluate the prepared scalar, treating non-finite numbers as expression errors.
     fn evaluate(&self, time: f64, value: f64) -> Option<f64> {
         let n = self.sample(time, value);
         n.is_finite().then_some(n)

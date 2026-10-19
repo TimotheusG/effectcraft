@@ -292,7 +292,7 @@ impl<'a> Cx<'a> {
         crate::fit(px, img.width, img.height, w, h)
     }
 
-    /// Open a file and remember ownership for cancellation cleanup (including overflow paths).
+    /// Open a file and remember ownership for failed-job cleanup (including overflow paths).
     pub fn create(&self, path: &str) -> crate::Result<out::Out<'_>> {
         let file = out::create(self.sink, path)?;
         if self.sink.is_none() {
@@ -301,13 +301,14 @@ impl<'a> Cx<'a> {
         Ok(file)
     }
 
-    pub fn remove_cancelled_outputs(&self) -> crate::Result<()> {
+    /// Remove only the files this job created when cancellation or another failure aborts it.
+    pub fn remove_failed_outputs(&self) -> crate::Result<()> {
         let mut failure = None;
         for path in self.written.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
             if let Err(e) = std::fs::remove_file(path)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
-                failure.get_or_insert_with(|| crate::ExportError::Io(format!("cannot remove cancelled output {path}: {e}")));
+                failure.get_or_insert_with(|| crate::ExportError::Io(format!("cannot remove failed output {path}: {e}")));
             }
         }
         match failure {
