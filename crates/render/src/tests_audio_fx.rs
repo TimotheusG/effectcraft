@@ -91,6 +91,7 @@ fn ramp(t: f64) -> (f32, f32) {
     (t as f32, -(t as f32))
 }
 
+/// Keys map layer seconds to source seconds; the synthetic source has distinct L/R samples.
 fn remap(p: &mut Project, cid: ItemId, points: &[(f64, f64)]) {
     let mut next = p.next_id;
     let mut prop = Ids(&mut next).prop("timeRemap", "Time Remap", Value::Scalar(0.0));
@@ -161,6 +162,87 @@ fn audio_time_remap_of_precomp_uses_nested_source_audio() {
     for i in 0..SR as usize {
         let expected = 0.25 + i as f64 / SR as f64 * 0.5;
         assert!((samples[i * 2] as f64 - expected).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn audio_time_remap_hold_repeats_the_selected_sample() {
+    let (mut p, cid) = comp_with(None, &[], false);
+    remap(&mut p, cid, &[(0.0, 0.75), (0.5, 1.25)]);
+    p.comp_mut(cid).unwrap().layers[0].props.prop_mut("timeRemap").unwrap().keys[0].out_interp = effectcraft_keyframe::Interp::Hold;
+    // A held picture selects a fixed audio sample (DC), not an advancing excerpt.
+    let samples = mix(&p, &Signal(ramp), cid, 0.0, SR as usize);
+    for (i, pair) in samples.as_chunks::<2>().0.iter().enumerate() {
+        let expected = if i < SR as usize / 2 { 0.75 } else { 1.25 };
+        assert_eq!(*pair, [expected, -expected], "sample {i}");
+    }
+}
+
+#[test]
+fn audio_time_remap_large_jump_keeps_source_requests_bounded() {
+    use std::sync::Mutex;
+    struct Requests(Mutex<Vec<usize>>);
+    impl FootageSource for Requests {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            None
+        }
+        fn audio(&self, _: ItemId, _: &Footage, _: Tick, frames: usize, _: u32) -> Option<Vec<f32>> {
+            self.0.lock().unwrap().push(frames);
+            // Assert before allocating: a distant key must not request the intervening audio.
+            assert!(frames <= 4097, "unbounded source request: {frames}");
+            Some(vec![0.25; frames * 2])
+        }
+    }
+    let (mut p, cid) = comp_with(None, &[], false);
+    remap(&mut p, cid, &[(0.0, 0.0), (0.5, 1_000_000.0)]);
+    p.comp_mut(cid).unwrap().layers[0].props.prop_mut("timeRemap").unwrap().keys[0].out_interp = effectcraft_keyframe::Interp::Hold;
+    let src = Requests(Mutex::new(Vec::new()));
+    assert!(mix(&p, &src, cid, 0.0, SR as usize).iter().all(|v| *v == 0.25));
+    assert_eq!(src.0.lock().unwrap().len(), 2, "one fetch per held source page");
+}
+
+#[test]
+fn audio_time_remap_source_bounds_and_pages_at_44100_hz() {
+    let (mut p, cid) = comp_with(None, &[], false);
+    remap(&mut p, cid, &[(0.0, -0.25), (1.0, 2.75)]);
+    let rate = 44_100;
+    let src = Signal(|_| (0.5, -0.5));
+    let whole = mix_comp(&p, &src, None, cid, Tick::ZERO, rate as usize, rate);
+    let mut blocked = Vec::new();
+    for first in (0..rate as usize).step_by(137) {
+        blocked.extend(mix_comp(&p, &src, None, cid, Tick::from_units(first as i64, rate as i64), 137.min(rate as usize - first), rate));
+    }
+    assert_eq!(whole, blocked, "source page and caller boundaries must not affect samples");
+    // Stay away from the one-sample interpolation transition at each source edge.
+    for (i, pair) in whole.as_chunks::<2>().0.iter().enumerate() {
+        let source = -0.25 + 3.0 * i as f64 / rate as f64;
+        if source < -0.001 || source > 2.001 {
+            assert_eq!(*pair, [0.0, 0.0], "sample {i}");
+        } else if (0.001..1.999).contains(&source) {
+            assert_eq!(*pair, [0.5, -0.5], "sample {i}");
+        }
+    }
+}
+
+#[test]
+fn audio_time_remap_expression_and_error_fallback() {
+    struct Expr(bool);
+    impl crate::ExprHost for Expr {
+        fn eval(&self, ctx: &crate::EvalCtx, _: &effectcraft_project::Layer, _: &effectcraft_project::Property, _: &Value) -> Result<Value, String> {
+            if self.0 { Ok(Value::Scalar(0.5 + ctx.time.seconds() * 0.5)) } else { Err("synthetic expression error".into()) }
+        }
+    }
+    let (mut p, cid) = comp_with(None, &[], false);
+    remap(&mut p, cid, &[(0.0, 1.25)]);
+    p.comp_mut(cid).unwrap().layers[0].props.prop_mut("timeRemap").unwrap().expr =
+        Some(effectcraft_project::Expression { text: "time / 2 + 0.5".into(), enabled: true });
+    for enabled in [true, false] {
+        let samples = mix_comp(&p, &Signal(ramp), Some(&Expr(enabled)), cid, Tick::ZERO, SR as usize, SR);
+        for (i, pair) in samples.as_chunks::<2>().0.iter().enumerate() {
+            let expected = if enabled { 0.5 + i as f64 / SR as f64 * 0.5 } else { 1.25 };
+            assert!((pair[0] as f64 - expected).abs() < 1e-5);
+            assert!((pair[1] as f64 + expected).abs() < 1e-5);
+        }
     }
 }
 
