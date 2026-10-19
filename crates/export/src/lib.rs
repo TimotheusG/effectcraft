@@ -21,6 +21,12 @@
 //! Overflow and a [`StorageQuota`] hook, files that don't fit go to the overflow folders. A
 //! render log (Errors Only / Plus Settings / Plus Per Frame Info) is written next to the output.
 //!
+//! Disk media is staged in unique temporary files beside each destination until encoding succeeds.
+//! A failed/cancelled job leaves existing destinations untouched. Publication is atomic per file,
+//! not across an image sequence; complete files already published before a rename failure remain.
+//! Sinks still receive each file when it finishes encoding. Staging needs space alongside any old
+//! output until publication, and a process crash may leave temporary files for manual cleanup.
+//!
 //! Frames are rendered in parallel batches (rayon; one batch ≈ one frame per core) and handed to
 //! the encoder in order. They share the job's layer cache, as viewer frames share the viewer's:
 //! static and transform-only layers render once per job. Progress is reported after each batch through a callback that can cancel
@@ -35,6 +41,7 @@
 mod encode;
 mod hevc_av1;
 mod out;
+mod pending;
 mod pipeline;
 mod uncompressed;
 mod webm;
@@ -177,9 +184,14 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
     let t0 = Instant::now();
     let cx = Cx::new(job);
     let mut r = export_with(&cx, progress, t0).await;
+    if r.is_ok()
+        && let Err(error) = cx.publish_outputs()
+    {
+        r = Err(error);
+    }
     if r.is_err() {
-        // Writers have dropped before this point, including on Windows. Only paths created by
-        // this job are owned; unrelated files and skipped sequence frames remain untouched.
+        // Writers have dropped, including on Windows. Cleanup touches staging files only;
+        // another process may now own the destination, and existing outputs remain intact.
         if let Err(cleanup) = cx.remove_failed_outputs() {
             return Err(ExportError::Io(format!("{}; cleanup failed: {cleanup}", r.as_ref().err().map_or_else(String::new, ToString::to_string))));
         }

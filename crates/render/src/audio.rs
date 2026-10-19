@@ -424,13 +424,31 @@ impl MixEnv<'_> {
         }
     }
 
-    /// Effect parameters at comp time `t`.
+    /// Evaluate any audio property under the same controls as per-sample Time Remap.
+    /// The host's scope also covers expressions reached through property references.
+    fn value(&self, l: &Layer, prop: &effectcraft_project::Property, t: Tick) -> effectcraft_keyframe::Value {
+        let base = prop.value_at(l.layer_time(t));
+        if !self.budget.charge(0, self.footage) {
+            return base;
+        }
+        let value = if prop.has_expression() {
+            self.expr.map(|h| h.eval_audio(&self.ctx(t), l, prop, &base, &self.budget.expressions).unwrap_or_else(|_| base.clone())).unwrap_or(base)
+        } else {
+            base
+        };
+        self.budget.charge(0, self.footage);
+        value
+    }
+
+    /// Effect parameters at comp time `t`, stopping as soon as shared controls expire.
     fn params(&self, l: &Layer, g: &effectcraft_project::PropGroup, t: Tick) -> Params {
-        let ctx = self.ctx(t);
         let mut p = Params::default();
         for c in &g.children {
+            if !self.budget.charge(0, self.footage) {
+                break;
+            }
             if let Node::Prop(pr) = c {
-                p.values.insert(pr.match_id.clone(), ctx.value(l, pr));
+                p.values.insert(pr.match_id.clone(), self.value(l, pr, t));
             }
         }
         p
@@ -440,7 +458,17 @@ impl MixEnv<'_> {
     /// `i0 .. i0 + n`.
     fn layer_audio(&self, l: &Layer, i0: i64, n: usize) -> Vec<f32> {
         let t = sample_tick(i0, self.rate);
-        let fx: Vec<(&str, Params)> = audio_effect_groups(l).map(|(id, g)| (id, self.params(l, g, t))).collect();
+        let mut fx = Vec::new();
+        for (id, g) in audio_effect_groups(l) {
+            if !self.budget.charge(0, self.footage) {
+                return Vec::new();
+            }
+            let params = self.params(l, g, t);
+            if !self.budget.charge(0, self.footage) {
+                return Vec::new();
+            }
+            fx.push((id, params));
+        }
         if fx.is_empty() {
             return self.layer_raw(l, i0, n, false);
         }
@@ -510,6 +538,9 @@ fn mix_into(
         }
         let t_a = sample_tick(s0 + a as i64, rate);
         let (ll, lr) = levels(&env, l, t_a);
+        if !budget.charge(0, footage) {
+            return;
+        }
         let (ll, lr) = (ll * gl, lr * gr);
         if ll == 0.0 && lr == 0.0 {
             continue;
@@ -525,7 +556,7 @@ fn mix_into(
 /// Evaluate the layer gains at the start of its audible block.
 fn levels(env: &MixEnv, l: &Layer, t: Tick) -> (f32, f32) {
     let Some(g) = l.props.sub("audio") else { return (1.0, 1.0) };
-    let [a, b] = env.ctx(t).v2(l, g, "levels", [0.0, 0.0]);
+    let [a, b] = g.get("levels").map(|p| env.value(l, p, t).as_vec2()).unwrap_or([0.0, 0.0]);
     (db_to_gain(a), db_to_gain(b))
 }
 

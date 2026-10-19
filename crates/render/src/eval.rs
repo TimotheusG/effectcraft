@@ -17,7 +17,7 @@ pub trait ExprHost: Send + Sync {
     fn prepare_audio(&self, _text: &str) -> Option<Box<dyn AudioExpression>> {
         None
     }
-    /// Evaluate one audio sample, allowing the production runtime to interrupt long scripts.
+    /// Evaluate an audio property (sample remap or block parameter) under shared interruption controls.
     fn eval_audio(&self, ctx: &EvalCtx, layer: &Layer, prop: &Property, value: &Value, _control: &crate::audio::AudioEvalControl) -> Result<Value, String> {
         self.eval(ctx, layer, prop, value)
     }

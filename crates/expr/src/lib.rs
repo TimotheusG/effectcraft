@@ -82,7 +82,7 @@ fn budget_left() -> Result<(), String> {
 pub struct Expressions;
 
 impl ExprHost for Expressions {
-    /// Evaluate one sample under the enclosing mix's shared interruption controls.
+    /// Evaluate a remap, level or effect parameter under the mix's shared interruption controls.
     fn eval_audio(
         &self,
         ctx: &EvalCtx,

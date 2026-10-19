@@ -194,6 +194,7 @@ mod imp {
         result.and(restored)
     }
 
+    /// Dispatch an authorized operation without holding the socket table during I/O.
     pub(super) fn run(op: &str, id: u32, p: &J) -> J {
         let utf8 = p.get("encoding").and_then(J::as_str).is_some_and(|e| e.eq_ignore_ascii_case("utf-8") || e.eq_ignore_ascii_case("utf8"));
         match op {
@@ -353,6 +354,7 @@ mod tests {
         (host, stop)
     }
 
+    /// Open a test connection through the production socket dispatcher.
     fn open(host: &str) -> u32 {
         let r = run("open", 0, &json!({"host": host, "timeout": 5}));
         r["id"].as_u64().unwrap_or_else(|| panic!("open {host}: {r}")) as u32
@@ -389,6 +391,7 @@ mod tests {
         rx.recv_timeout(limit).ok()
     }
 
+    /// A bounded write times out even when the peer never drains its receive buffer.
     #[test]
     fn a_write_to_a_peer_that_stops_reading_fails_after_the_timeout() {
         // #1248: it used to block for good.
@@ -403,6 +406,7 @@ mod tests {
         run("close", id, &J::Null);
     }
 
+    /// Closing a stalled stream interrupts its writer without blocking another socket.
     #[test]
     fn a_blocked_socket_doesnt_hold_up_the_others_and_close_interrupts_it() {
         let (host_a, _keep_a) = stalled_peer();

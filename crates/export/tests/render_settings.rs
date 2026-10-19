@@ -363,6 +363,7 @@ fn wav_and_aiff_channels_and_formats() {
     assert_eq!(u16::from_be_bytes([d[26], d[27]]), 24, "sample size");
 }
 
+/// Cancellation preserves unrelated and skipped files, including overflow destinations.
 #[test]
 fn cancelled_export_removes_only_files_it_opened() {
     use effectcraft_export::ExportError;
@@ -557,6 +558,48 @@ fn audio_failure_removes_partial_movie_output() {
         assert!(result.unwrap_err().to_string().contains("work limit"));
         assert!(!path.exists(), "failed export left {}", path.display());
         assert_eq!(std::fs::read(&decoy).unwrap(), b"keep");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A failed job must not delete another writer's replacement at its output path.
+#[test]
+fn failed_export_preserves_replacement_at_destination() {
+    let dir = std::env::temp_dir().join(format!("ec-replaced-output-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    for format in [OutputFormat::PngSequence, OutputFormat::Uncompressed] {
+        let om = OutputModule::for_format(format);
+        let pattern = dir.join(if format.is_sequence() { "clip_[#####].png" } else { "clip.mov" });
+        let destination = dir.join(if format.is_sequence() { "clip_00000.png" } else { "clip.mov" });
+        let replacement = dir.join("replacement");
+        let result = export(
+            &Job {
+                project: &p,
+                footage: &NoFootage,
+                expr: None,
+                accel: None,
+                comp: cid,
+                settings: &custom(0.0, 0.04),
+                output: &om,
+                path: pattern.to_str().unwrap(),
+                sink: None,
+                nested_switches: true,
+                options: JobOptions::default(),
+            },
+            &mut |progress| {
+                if progress.done == 0 {
+                    return true;
+                }
+                std::fs::write(&replacement, b"other writer's complete output").unwrap();
+                std::fs::rename(&replacement, &destination).unwrap();
+                false
+            },
+        );
+        assert!(matches!(result, Err(effectcraft_export::ExportError::Cancelled)));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"other writer's complete output");
+        std::fs::remove_file(destination).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

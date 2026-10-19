@@ -17,6 +17,7 @@ use std::sync::{
 /// Forces the full JavaScript path as an independent oracle for prepared expressions.
 struct JavaScript;
 impl ExprHost for JavaScript {
+    /// Delegate unchanged property evaluation to the production JavaScript engine.
     fn eval(&self, ctx: &EvalCtx, layer: &Layer, prop: &Property, value: &Value) -> Result<Value, String> {
         Expressions.eval(ctx, layer, prop, value)
     }
@@ -164,9 +165,11 @@ fn audio_deadline_and_yield_allowance_are_cumulative() {
     // receiving a fresh budget. A deterministic host makes this independent of machine speed.
     struct Yielding;
     impl ExprHost for Yielding {
+        /// Preserve the keyframed value outside controlled audio evaluation.
         fn eval(&self, _: &EvalCtx, _: &Layer, _: &Property, v: &Value) -> Result<Value, String> {
             Ok(v.clone())
         }
+        /// Charge a deterministic yield to verify sharing across evaluations.
         fn eval_audio(&self, _: &EvalCtx, _: &Layer, _: &Property, v: &Value, c: &effectcraft_render::audio::AudioEvalControl) -> Result<Value, String> {
             c.yielded();
             Ok(v.clone())
@@ -177,4 +180,92 @@ fn audio_deadline_and_yield_allowance_are_cumulative() {
     assert_eq!(mix_comp_with_control(&p, &workload::Source::default(), Some(&Yielding), cid, Tick::ZERO, 10, 48000, &control), Err(AudioError::WorkLimit));
     let (p, cid) = workload::project(1, 0, Some("Math.sin(time)"));
     assert!(mix_comp(&p, &workload::Source::default(), Some(&Expressions), cid, Tick::ZERO, 32, 48000).is_ok());
+}
+
+/// Put an expression on levels or a Tone parameter inside two remapped precomps.
+fn parameter_project(effect: bool, text: &str, layers: usize) -> (effectcraft_project::Project, effectcraft_project::ItemId) {
+    use effectcraft_project::{Expression, build::Ids};
+    let (mut p, cid) = workload::project(layers, 2, None);
+    let leaf =
+        p.comps().find(|(_, c)| c.layers.iter().any(|l| matches!(l.source, effectcraft_project::LayerSource::Footage { .. }))).map(|(id, _)| *id).unwrap();
+    for i in 0..layers {
+        let expr = Some(Expression { text: text.into(), enabled: true });
+        if effect {
+            let spec = effectcraft_effects::find("ec.audio.tone").unwrap();
+            let mut group = effectcraft_effects::instantiate(spec, &mut Ids(&mut p.next_id), spec.name, [16.0, 16.0]);
+            let prop = group.children.iter_mut().find_map(|n| if let effectcraft_project::Node::Prop(p) = n { Some(p) } else { None }).unwrap();
+            prop.expr = expr;
+            p.comp_mut(leaf).unwrap().layers[i].props.sub_mut("effects").unwrap().children.push(group.into());
+        } else {
+            p.comp_mut(leaf).unwrap().layers[i].props.sub_mut("audio").unwrap().prop_mut("levels").unwrap().expr = expr;
+        }
+    }
+    (p, cid)
+}
+
+/// Production parameter scripts obey resource limits; ordinary errors retain keyframed fallback.
+#[test]
+fn nested_audio_parameters_observe_script_limits_and_recover() {
+    for effect in [false, true] {
+        let (p, cid) = parameter_project(effect, "var n=0; for(var i=0;i<10000;i++) n+=Math.sin(i); value", 1);
+        let source = workload::Source::default();
+        let control = MixControl { max_expression_yields: Some(0), max_duration: Some(std::time::Duration::from_secs(30)), ..Default::default() };
+        assert_eq!(mix_comp_with_control(&p, &source, Some(&Expressions), cid, Tick::ZERO, 2, 48000, &control), Err(AudioError::WorkLimit), "effect={effect}");
+        assert_eq!(source.reads.load(Ordering::Relaxed), 0);
+        // The same thread's runtime recovers; normal script errors still fall back to keys.
+        let (p, cid) = parameter_project(effect, "throw new Error('ordinary error')", 1);
+        let actual = mix_comp(&p, &source, Some(&Expressions), cid, Tick::ZERO, 32, 48000).unwrap();
+        let expected = mix_comp(&p, &source, None, cid, Tick::ZERO, 32, 48000).unwrap();
+        assert_eq!(actual, expected);
+    }
+}
+
+/// Each layer consumes the same allowance; reaching the limit prevents subsequent evaluation.
+#[test]
+fn nested_audio_parameters_share_one_yield_allowance() {
+    #[derive(Default)]
+    struct Yielding(std::sync::atomic::AtomicUsize);
+    impl ExprHost for Yielding {
+        /// Preserve the keyframed value outside controlled audio evaluation.
+        fn eval(&self, _: &EvalCtx, _: &Layer, _: &Property, v: &Value) -> Result<Value, String> {
+            Ok(v.clone())
+        }
+        /// Charge a deterministic yield to verify sharing across evaluations.
+        fn eval_audio(&self, _: &EvalCtx, _: &Layer, _: &Property, v: &Value, c: &effectcraft_render::audio::AudioEvalControl) -> Result<Value, String> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            c.yielded();
+            Ok(v.clone())
+        }
+    }
+    for effect in [false, true] {
+        let (p, cid) = parameter_project(effect, "value", 8);
+        let host = Yielding::default();
+        let control = MixControl { max_expression_yields: Some(2), ..Default::default() };
+        assert_eq!(mix_comp_with_control(&p, &workload::Source::default(), Some(&host), cid, Tick::ZERO, 10, 48000, &control), Err(AudioError::WorkLimit));
+        assert_eq!(host.0.load(Ordering::Relaxed), 3);
+    }
+}
+
+/// Cancellation interrupts a running volume/effect script and leaves its runtime reusable.
+#[test]
+fn cancellation_interrupts_nested_audio_parameters() {
+    for effect in [false, true] {
+        let (p, cid) = parameter_project(effect, "function g() { for(var i=0;i<900000;i++) {} } for(var k=0;k<900000;k++) g()", 1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let (done, completion) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let source = workload::Source::default();
+            let control = MixControl { cancel: Some(signal), max_expression_yields: Some(usize::MAX), ..Default::default() };
+            assert_eq!(mix_comp_with_control(&p, &source, Some(&Expressions), cid, Tick::ZERO, 2, 48000, &control), Err(AudioError::Cancelled));
+            assert_eq!(source.reads.load(Ordering::Relaxed), 0);
+            let (p, cid) = parameter_project(effect, "value", 1);
+            assert!(mix_comp(&p, &source, Some(&Expressions), cid, Tick::ZERO, 32, 48000).is_ok());
+            done.send(()).unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cancel.store(true, Ordering::Relaxed);
+        completion.recv_timeout(std::time::Duration::from_secs(3)).expect("parameter script must observe cancellation");
+        worker.join().unwrap();
+    }
 }
