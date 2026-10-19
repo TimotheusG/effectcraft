@@ -29,6 +29,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod audio;
 pub mod host;
 mod noise;
 pub mod rewrite;
@@ -80,6 +81,22 @@ fn budget_left() -> Result<(), String> {
 pub struct Expressions;
 
 impl ExprHost for Expressions {
+    fn eval_audio(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        prop: &Property,
+        value: &Value,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Value, String> {
+        let _guard = runtime::AudioCancel::enter(cancel);
+        self.eval(ctx, layer, prop, value)
+    }
+
+    fn prepare_audio(&self, text: &str) -> Option<Box<dyn effectcraft_render::AudioExpression>> {
+        audio::prepare(text)
+    }
+
     fn eval(&self, ctx: &EvalCtx, layer: &Layer, prop: &Property, value: &Value) -> Result<Value, String> {
         match &prop.expr {
             Some(e) => evaluate(self, ctx, layer, prop, value, &e.text),

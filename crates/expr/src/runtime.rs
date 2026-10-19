@@ -44,6 +44,7 @@ pub struct Owner {
 }
 
 thread_local! {
+    static AUDIO_CANCEL: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> = const { RefCell::new(None) };
     /// Never dropped: boa's own thread-local heap may be torn down first at thread exit, and
     /// dropping GC handles after that aborts the process. The OS reclaims it with the thread.
     static RUNTIME: RefCell<Option<ManuallyDrop<Result<Runtime, String>>>> = const { RefCell::new(None) };
@@ -57,6 +58,20 @@ thread_local! {
 thread_local! {
     /// When the outermost evaluation on this thread began.
     pub static STARTED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores the previous cancellation context even when nested expression evaluation fails.
+pub struct AudioCancel(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
+impl AudioCancel {
+    /// Install the audio mix token for the duration of one expression evaluation.
+    pub fn enter(cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Self {
+        Self(AUDIO_CANCEL.with(|c| c.replace(cancel.cloned())))
+    }
+}
+impl Drop for AudioCancel {
+    fn drop(&mut self) {
+        AUDIO_CANCEL.with(|c| c.replace(self.0.take()));
+    }
 }
 
 struct Runtime {
@@ -351,6 +366,9 @@ fn max_time() -> std::time::Duration {
 
 /// Whether the outermost evaluation on this thread has used up [`crate::MAX_TIME`].
 pub fn out_of_time() -> bool {
+    if AUDIO_CANCEL.with(|c| c.borrow().as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))) {
+        return true;
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         STARTED.with(|s| s.get()).is_some_and(|t| t.elapsed() > max_time())

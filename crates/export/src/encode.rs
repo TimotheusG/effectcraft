@@ -215,9 +215,13 @@ fn deinterleave(buf: &[f32], channels: usize) -> Vec<Vec<f32>> {
 
 /// The comp's audio over `n` samples from `start`, interleaved with the module's channel count
 /// (mono = the average of left and right).
-pub(crate) fn mix(cx: &Cx, start: effectcraft_time::Tick, n: usize, sr: u32) -> Vec<f32> {
-    let st = effectcraft_render::audio::mix_comp(&cx.project, cx.footage, cx.expr, cx.comp, start, n, sr);
-    if cx.output.audio_channels == 1 { st.as_chunks::<2>().0.iter().map(|p| (p[0] + p[1]) * 0.5).collect() } else { st }
+pub(crate) fn mix(cx: &Cx, start: effectcraft_time::Tick, n: usize, sr: u32) -> Result<Vec<f32>> {
+    let control = effectcraft_render::audio::MixControl { cancel: cx.options.cancel.clone(), ..Default::default() };
+    let st = effectcraft_render::audio::mix_comp_with_control(&cx.project, cx.footage, cx.expr, cx.comp, start, n, sr, &control).map_err(|e| match e {
+        effectcraft_render::audio::AudioError::Cancelled => ExportError::Cancelled,
+        _ => ExportError::Encode(e.to_string()),
+    })?;
+    Ok(if cx.output.audio_channels == 1 { st.as_chunks::<2>().0.iter().map(|p| (p[0] + p[1]) * 0.5).collect() } else { st })
 }
 
 /// PCM bytes of samples in `fmt` (little or big endian).
@@ -334,7 +338,7 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         let n = (end - *cursor) as usize;
         let start = Tick::from_units(*cursor, i64::from(sr));
         let start = if start.to_units_floor(i64::from(sr)) < *cursor { Tick(start.0.saturating_add(1)) } else { start };
-        let buf = mix(job, start, n, sr);
+        let buf = mix(job, start, n, sr)?;
         *cursor = end;
         match a {
             Audio::Aac(e) => {

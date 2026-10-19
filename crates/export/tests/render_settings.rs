@@ -476,3 +476,22 @@ fn a_job_renders_on_one_compositor() {
     assert_eq!(cpu.frames.load(Ordering::SeqCst), 0);
     assert_eq!(c[0].get_pixel(10, 44).0, [255, 0, 0, 255], "the CPU drew the red block");
 }
+
+/// Cancellation and excessive audio work propagate through the encoder instead of producing a report.
+#[test]
+fn audio_mix_failures_abort_export() {
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let om = OutputModule::for_format(OutputFormat::Wav);
+    let options = JobOptions { cancel: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))), ..Default::default() };
+    let (result, _) = run_with(&p, cid, &custom(0.0, 0.5), &om, "/cancel.wav", options, false);
+    assert_eq!(result.unwrap_err(), "cancelled");
+    let (p, cid) = project(FrameRate::new(25, 1), |p, c| {
+        let f = effectcraft_project::Footage { has_audio: true, ..Default::default() };
+        let id = p.add_item("audio", Label::SeaFoam, None, ItemKind::Footage(f));
+        let mut layer = build::layer(p, c, "audio", LayerSource::Footage { item: id }, (0, 0), None);
+        layer.stretch = 0.000001;
+        c.layers.push(layer);
+    });
+    let (result, _) = run_with(&p, cid, &custom(0.0, 0.5), &om, "/limited.wav", JobOptions::default(), false);
+    assert!(result.unwrap_err().contains("audio mixing exceeded its work limit"));
+}

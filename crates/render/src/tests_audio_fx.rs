@@ -84,7 +84,7 @@ fn comp_with(id: Option<&str>, vals: &[(&str, Value)], solid: bool) -> (Project,
 }
 
 fn mix(p: &Project, src: &dyn FootageSource, cid: ItemId, from: f64, frames: usize) -> Vec<f32> {
-    mix_comp(p, src, None, cid, Tick::from_seconds_f64(from), frames, SR)
+    mix_comp(p, src, None, cid, Tick::from_seconds_f64(from), frames, SR).unwrap()
 }
 
 fn ramp(t: f64) -> (f32, f32) {
@@ -207,10 +207,10 @@ fn audio_time_remap_source_bounds_and_pages_at_44100_hz() {
     remap(&mut p, cid, &[(0.0, -0.25), (1.0, 2.75)]);
     let rate = 44_100;
     let src = Signal(|_| (0.5, -0.5));
-    let whole = mix_comp(&p, &src, None, cid, Tick::ZERO, rate as usize, rate);
+    let whole = mix_comp(&p, &src, None, cid, Tick::ZERO, rate as usize, rate).unwrap();
     let mut blocked = Vec::new();
     for first in (0..rate as usize).step_by(137) {
-        blocked.extend(mix_comp(&p, &src, None, cid, Tick::from_units(first as i64, rate as i64), 137.min(rate as usize - first), rate));
+        blocked.extend(mix_comp(&p, &src, None, cid, Tick::from_units(first as i64, rate as i64), 137.min(rate as usize - first), rate).unwrap());
     }
     assert_eq!(whole, blocked, "source page and caller boundaries must not affect samples");
     // Stay away from the one-sample interpolation transition at each source edge.
@@ -237,7 +237,7 @@ fn audio_time_remap_expression_and_error_fallback() {
     p.comp_mut(cid).unwrap().layers[0].props.prop_mut("timeRemap").unwrap().expr =
         Some(effectcraft_project::Expression { text: "time / 2 + 0.5".into(), enabled: true });
     for enabled in [true, false] {
-        let samples = mix_comp(&p, &Signal(ramp), Some(&Expr(enabled)), cid, Tick::ZERO, SR as usize, SR);
+        let samples = mix_comp(&p, &Signal(ramp), Some(&Expr(enabled)), cid, Tick::ZERO, SR as usize, SR).unwrap();
         for (i, pair) in samples.as_chunks::<2>().0.iter().enumerate() {
             let expected = if enabled { 0.5 + i as f64 / SR as f64 * 0.5 } else { 1.25 };
             assert!((pair[0] as f64 - expected).abs() < 1e-5);

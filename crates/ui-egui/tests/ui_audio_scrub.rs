@@ -192,3 +192,20 @@ fn preview_with_audio_sounds_once_rendering_keeps_up() {
     }
     assert!(h.state().audio.is_some() && fake.0.lock().unwrap().0.is_some(), "the sound started within 2 s, at frame {last} of 900");
 }
+
+/// Mixer failures are visible to the user, and no partial snippet reaches the audio device.
+#[test]
+fn scrub_reports_excessive_audio_work() {
+    let fake = Fake::default();
+    let (mut app, cid) = setup(true, &fake);
+    Arc::make_mut(&mut app.session.project).comp_mut(cid).unwrap().layers[0].stretch = 0.000001;
+    app.scrub_audio(cid, Tick::ZERO, 0.0);
+    assert!(app.ui.status.contains("audio mixing exceeded its work limit"));
+    let feed = fake.0.lock().unwrap().0.clone().unwrap();
+    assert_eq!(feed.queued_frames(), 0);
+    assert!(feed.error().is_some());
+    Arc::make_mut(&mut app.session.project).comp_mut(cid).unwrap().layers[0].stretch = 100.0;
+    app.scrub_audio(cid, Tick::from_seconds_f64(0.1), 0.1);
+    assert!(feed.queued_frames() > 0);
+    assert!(feed.error().is_none(), "a later successful mix recovers in the same session");
+}
