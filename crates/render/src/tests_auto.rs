@@ -21,6 +21,7 @@ impl MockAccel {
     fn new(handle: bool) -> MockAccel {
         MockAccel { handle, calls: Default::default(), pick: Default::default() }
     }
+    /// Number of full-frame requests dispatched to this accelerator.
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
@@ -51,6 +52,7 @@ impl Accelerator for MockAccel {
     }
 }
 
+/// A small red solid whose centre pixel is shared by the CPU and mock GPU fixtures.
 fn project() -> (Project, ItemId) {
     let mut p = Project::default();
     p.settings.gpu_acceleration = true;
@@ -128,6 +130,7 @@ fn auto_backend_falls_back_when_the_accelerator_declines() {
     assert!((1..=4).contains(&asked), "asked {asked} times in {n} frames");
 }
 
+/// Periodic probes detect a formerly slow GPU becoming faster, without mixing cache keys.
 #[test]
 fn auto_pick_follows_changing_costs() {
     let pick = AutoPick::default();
