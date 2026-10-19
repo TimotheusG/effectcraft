@@ -21,7 +21,15 @@ impl Pending {
         {
             let dir = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
             std::fs::create_dir_all(dir).map_err(io)?;
-            let (file, temporary) = tempfile::Builder::new().prefix(".effectcraft-export-").tempfile_in(dir).map_err(io)?.into_parts();
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(".effectcraft-export-");
+            // Match File::create: let the process umask restrict ordinary export permissions.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(std::fs::Permissions::from_mode(0o666));
+            }
+            let (file, temporary) = builder.tempfile_in(dir).map_err(io)?.into_parts();
             self.files.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((temporary, path.to_owned()));
             Ok(out::Out::File(std::io::BufWriter::new(file)))
         }
@@ -69,6 +77,21 @@ impl Pending {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Published exports use the same umask-filtered mode as an ordinary newly created file.
+    #[cfg(unix)]
+    #[test]
+    fn publication_preserves_normal_creation_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ordinary = dir.path().join("ordinary.mov");
+        std::fs::File::create(&ordinary).unwrap();
+        let path = dir.path().join("export.mov");
+        let pending = Pending::default();
+        pending.create(None, path.to_str().unwrap()).unwrap().finish().unwrap();
+        pending.publish().unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, std::fs::metadata(ordinary).unwrap().permissions().mode() & 0o777);
+    }
 
     /// A failed replacement leaves old contents intact; a successful one publishes full bytes.
     #[test]
