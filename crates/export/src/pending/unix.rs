@@ -17,6 +17,16 @@ pub(super) struct Policy {
 }
 
 impl Policy {
+    /// Unix replacement uses the same ownership, mode, and access-ACL snapshot as creation.
+    pub fn read_existing(path: &Path) -> io::Result<Self> {
+        Self::read(path)
+    }
+
+    /// Verify the restored access policy against this output's snapshot.
+    pub fn matches(&self, path: &Path) -> io::Result<bool> {
+        Ok(Self::read(path)? == *self)
+    }
+
     /// Snapshot ownership, access controls, and permission state used for publication checks.
     pub fn read(path: &Path) -> io::Result<Self> {
         let metadata = fs::metadata(path)?;

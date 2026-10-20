@@ -47,7 +47,7 @@ impl Version {
             change_stamp: platform::change_stamp(file)?,
             len: metadata.len(),
             modified: metadata.modified()?,
-            policy: platform::Policy::read(path)?,
+            policy: platform::Policy::read_existing(path)?,
         })
     }
 }
@@ -88,10 +88,7 @@ impl Staged {
             None => platform::Policy::read(probe.path())?,
         };
         policy.apply(probe.path())?;
-        let restored = platform::Policy::read(probe.path())?;
-        if restored != policy {
-            #[cfg(test)]
-            eprintln!("policy restoration mismatch: expected {policy:?}; restored {restored:?}");
+        if !policy.matches(probe.path())? {
             return Err(io::Error::other("cannot preserve export destination access policy on this filesystem"));
         }
         probe.close()?;
@@ -145,7 +142,7 @@ impl Staged {
     fn publish_inner(&self) -> io::Result<()> {
         self.validate()?;
         self.policy.apply(&self.temporary)?;
-        if platform::Policy::read(&self.temporary)? != self.policy {
+        if !self.policy.matches(&self.temporary)? {
             return Err(io::Error::other("staged export access policy could not be preserved"));
         }
         self.validate()?;
@@ -212,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
     fn lifecycle_preserves_existing_bytes_until_publish_and_cleans_owned_files() {
         for existing in [false, true] {
             for action in ["drop", "discard", "publish"] {
@@ -248,6 +246,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
     fn competing_jobs_and_external_writes_are_not_overwritten_or_deleted() {
         for existing in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -365,6 +364,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
     fn windows_inherited_and_protected_acls_and_policy_changes() {
         use windows_permissions::{
             constants::{SeObjectType as O, SecurityInformation as S},
@@ -461,6 +461,7 @@ mod tests {
     }
     /// More frames than a typical descriptor limit: snapshots retain metadata, not open files.
     #[test]
+    #[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
     fn replacement_sequence_keeps_file_handle_use_constant() {
         let dir = tempfile::tempdir().unwrap();
         let mut pending = Vec::new();
@@ -476,5 +477,65 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), b"new");
         }
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1536);
+    }
+
+    /// Refusal must leave existing bytes and policy intact without disabling new exports.
+    #[cfg(windows)]
+    #[test]
+    fn windows_audit_refusal_preserves_existing_and_allows_new() {
+        const CHILD: &str = "EFFECTCRAFT_AUDIT_REFUSAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = format!("{}::windows_audit_refusal_preserves_existing_and_allows_new", module_path!().split_once("::").unwrap().1);
+            let status = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", &name, "--nocapture"]).env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        // Privilege removal affects only this isolated child, never parallel tests.
+        let token = winsafe::HPROCESS::GetCurrentProcess().OpenProcessToken(winsafe::co::TOKEN::ADJUST_PRIVILEGES | winsafe::co::TOKEN::QUERY).unwrap();
+        let luid = winsafe::LookupPrivilegeValue(None, winsafe::co::SE_PRIV::SECURITY_NAME).unwrap();
+        let privileges = winsafe::TOKEN_PRIVILEGES::new(&[winsafe::LUID_AND_ATTRIBUTES::new(luid, winsafe::co::SE_PRIV_ATTR::REMOVED)]).unwrap();
+        token.AdjustTokenPrivileges(winsafe::DisabPriv::Privs(&privileges)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("old.mov");
+        fs::write(&existing, b"old complete movie").unwrap();
+        let error = match Staged::create(existing.to_str().unwrap()) {
+            Ok(_) => panic!("replacement unexpectedly succeeded without audit privilege"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Windows audit policy"), "{error}");
+        assert_eq!(fs::read(&existing).unwrap(), b"old complete movie");
+        let new = dir.path().join("new.mov");
+        stage(&new, b"new complete movie").publish().unwrap();
+        assert_eq!(fs::read(new).unwrap(), b"new complete movie");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    /// Audit ACEs and SACL protection survive replacement; changes during rendering refuse it.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner"]
+    fn windows_audit_entries_and_protection_are_preserved() {
+        use windows_permissions::{
+            constants::{SeObjectType as O, SecurityInformation as S},
+            wrappers as w,
+        };
+        for protected in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("audited.mov");
+            fs::write(&path, b"old complete movie").unwrap();
+            let descriptor = w::ConvertStringSecurityDescriptorToSecurityDescriptor("S:P(AU;SAFA;FW;;;WD)").unwrap();
+            let flags = S::Sacl | if protected { S::ProtectedSacl } else { S::UnprotectedSacl };
+            w::SetNamedSecurityInfo(path.as_os_str(), O::SE_FILE_OBJECT, flags, None, None, None, w::GetSecurityDescriptorSacl(&descriptor).unwrap()).unwrap();
+            let expected = platform::Policy::read_existing(&path).unwrap();
+            stage(&path, b"complete replacement").publish().unwrap();
+            assert!(expected.matches(&path).unwrap());
+            let staged = stage(&path, b"must not publish");
+            let changed = w::ConvertStringSecurityDescriptorToSecurityDescriptor("S:P(AU;SAFA;FR;;;WD)").unwrap();
+            w::SetNamedSecurityInfo(path.as_os_str(), O::SE_FILE_OBJECT, flags, None, None, None, w::GetSecurityDescriptorSacl(&changed).unwrap()).unwrap();
+            let changed = platform::Policy::read_existing(&path).unwrap();
+            assert!(staged.publish().is_err());
+            assert_eq!(fs::read(&path).unwrap(), b"complete replacement");
+            assert!(changed.matches(&path).unwrap());
+        }
     }
 }

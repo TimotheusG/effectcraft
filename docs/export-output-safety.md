@@ -28,6 +28,12 @@ by the platform adapter; errors preserve the old output instead of weakening acc
   duplicates of existing unconditional allow grants. Only that equivalent form
   is accepted; new rights, deny changes, protection changes, and SACL changes
   still fail policy verification.
+  Replacement also captures, restores, and verifies the full audit SACL and its
+  protection state. This requires SeSecurityPrivilege to already be enabled in
+  the exporting process. The application does not enable or acquire privileges.
+  If full audit policy cannot be inspected, replacement fails before rendering
+  and leaves the existing file intact; choose a new output filename instead.
+  New destinations do not require this privilege and retain normal inheritance.
 - Linux preserves numeric ownership, permission bits, and security/system xattrs,
   including POSIX access ACLs. A setgid directory cannot silently change the owner
   group of an existing output. No libacl dependency is added on Linux.
@@ -70,3 +76,11 @@ Linux includes a named-user ACL and a differing-group setgid case when run as ro
 The export integration tests cancel after writing begins and compare successful
 movie/sequence output against sink bytes. The filesystem workflow runs these on
 Windows, Linux and macOS. Local cross-compilation alone is not runtime validation.
+
+Windows tests that replace existing files explicitly require enabled
+SeSecurityPrivilege. An ordinary local test run marks those cases ignored rather
+than pretending audit preservation was exercised. The Windows filesystem workflow
+runs `windows_audit_tests`, a CI-only launcher that enables an already-granted
+privilege and runs both native and integration suites with `--include-ignored`.
+It also runs refusal in a separate child process with that privilege removed,
+checking old bytes, absence of staging, and successful export to a new filename.

@@ -30,6 +30,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Native filesystem contract
+        if: runner.os != 'Windows'
         run: cargo test --locked --release -p effectcraft-export --lib pending::native
       - name: Export integration
+        if: runner.os != 'Windows'
         run: cargo test --locked --release -p effectcraft-export --test render_settings
+      - name: Windows audit-safe replacement and unprivileged refusal
+        if: runner.os == 'Windows'
+        run: cargo run --locked --release -p effectcraft-export --example windows_audit_tests

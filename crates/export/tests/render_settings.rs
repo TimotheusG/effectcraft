@@ -479,6 +479,7 @@ fn a_job_renders_on_one_compositor() {
 
 /// Cancellation after an encoder has opened its output must preserve the prior export.
 #[test]
+#[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
 fn cancelled_replacement_preserves_existing_movie_and_sequence() {
     let dir = std::env::temp_dir().join(format!("ec-preserve-export-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -515,6 +516,7 @@ fn cancelled_replacement_preserves_existing_movie_and_sequence() {
 /// A complete two-second export matches the sink output byte-for-byte, both for a new
 /// destination and a replacement. This exercises the real muxer and parallel sequence path.
 #[test]
+#[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
 fn published_movie_and_sequence_match_complete_sink_outputs() {
     let dir = tempfile::tempdir().unwrap();
     let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
@@ -561,6 +563,7 @@ fn published_movie_and_sequence_match_complete_sink_outputs() {
 
 /// An I/O failure after a sequence starts must also preserve all earlier complete outputs.
 #[test]
+#[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
 fn sequence_write_failure_preserves_existing_frames() {
     let dir = tempfile::tempdir().unwrap();
     let blocked = dir.path().join("blocked-overflow");

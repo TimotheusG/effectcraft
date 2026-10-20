@@ -15,12 +15,14 @@ const OBJECT: O = O::SE_FILE_OBJECT;
 pub(super) struct Policy {
     descriptor: OsString,
     readonly: bool,
+    audit: bool,
 }
 
 impl PartialEq for Policy {
     /// Compare access policy while tolerating Windows' duplicate-grant legacy conversion.
     fn eq(&self, other: &Self) -> bool {
         self.readonly == other.readonly
+            && self.audit == other.audit
             && comparison_descriptor(&self.descriptor.to_string_lossy()) == comparison_descriptor(&other.descriptor.to_string_lossy())
     }
 }
@@ -72,10 +74,35 @@ fn comparison_descriptor(descriptor: &str) -> String {
 impl Policy {
     /// Snapshot ownership, access controls, and permission state used for publication checks.
     pub fn read(path: &Path) -> io::Result<Self> {
-        let descriptor = w::GetNamedSecurityInfo(path.as_os_str(), OBJECT, S::Owner | S::Group | S::Dacl | S::Label | S::Attribute | S::Scope)?;
+        Self::read_with_audit(path, false)
+    }
+
+    /// Replacing an inode requires its full audit policy, not only access-control metadata.
+    pub fn read_existing(path: &Path) -> io::Result<Self> {
+        Self::read_with_audit(path, true)
+    }
+
+    /// Verify exactly the policy components captured for this output.
+    pub fn matches(&self, path: &Path) -> io::Result<bool> {
+        Ok(Self::read_with_audit(path, self.audit)? == *self)
+    }
+
+    /// Full SACL reads require an already-enabled SeSecurityPrivilege; never silently
+    /// fall back to a partial snapshot or alter the application's privilege state.
+    fn read_with_audit(path: &Path, audit: bool) -> io::Result<Self> {
+        let mut flags = S::Owner | S::Group | S::Dacl | S::Label | S::Attribute | S::Scope;
+        if audit {
+            flags |= S::Sacl;
+        }
+        let descriptor = w::GetNamedSecurityInfo(path.as_os_str(), OBJECT, flags).map_err(|error| {
+            if audit {
+                io::Error::new(error.kind(), format!("cannot preserve the existing export's Windows audit policy: {error}; replacement requires enabled SeSecurityPrivilege; choose a new output filename"))
+            } else { error }
+        })?;
         Ok(Self {
             descriptor: w::ConvertSecurityDescriptorToStringSecurityDescriptor(&descriptor, S::Owner | S::Group | S::Dacl | S::Sacl)?,
             readonly: path.metadata()?.permissions().readonly(),
+            audit,
         })
     }
 
@@ -90,6 +117,10 @@ impl Policy {
         let mut flags = S::Owner | S::Group | S::Dacl | if protected { S::ProtectedDacl } else { S::UnprotectedDacl };
         if sacl.is_some() {
             flags |= S::Label | S::Attribute | S::Scope;
+        }
+        if self.audit {
+            let protected_sacl = text.split("S:").nth(1).unwrap_or("").split('(').next().unwrap_or("").contains('P');
+            flags |= S::Sacl | if protected_sacl { S::ProtectedSacl } else { S::UnprotectedSacl };
         }
         w::SetNamedSecurityInfo(
             path.as_os_str(),
