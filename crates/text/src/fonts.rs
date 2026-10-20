@@ -328,8 +328,12 @@ pub fn add_source(src: &dyn FontSource) -> usize {
             n += 1;
         }
     }
-    // A new face can belong to one of a script's usual families.
+    // Cache hits may read the database while holding a fallback-cache read lock.
+    // Release the database before invalidating either cache to avoid the reverse lock order.
+    drop(d);
+    // A new face can belong to one of a script's usual families or cover a cached missing glyph.
     family_faces_cache().write().unwrap_or_else(|e| e.into_inner()).clear();
+    fallback_cache().write().unwrap_or_else(|e| e.into_inner()).clear();
     n
 }
 
@@ -339,7 +343,10 @@ pub fn add_font_data(data: Vec<u8>) -> Vec<FaceId> {
     let names = read_faces_bytes(&data);
     let mut d = db().write().unwrap_or_else(|e| e.into_inner());
     let ids = names.into_iter().map(|n| push(&mut d, info_from(n, FaceData::Shared(data.clone()), "user"))).collect();
+    // Match add_source's database-before-cache lock release order.
+    drop(d);
     family_faces_cache().write().unwrap_or_else(|e| e.into_inner()).clear();
+    fallback_cache().write().unwrap_or_else(|e| e.into_inner()).clear();
     ids
 }
 
@@ -889,11 +896,12 @@ fn glyph_draws(font: &FontRef, gid: skrifa::GlyphId) -> bool {
 }
 
 /// Results of the search over every installed font in [`fallback_for`], per 256-character block and
-/// preferred face (so bold text gets the bold cut of the fallback family). `None` records that
+/// preferred face (so bold text gets the bold cut of the fallback family) and database revision.
+/// A search finishing after registration cannot cache a miss for the new revision. `None` records that
 /// nothing installed covers the block, so the search over every font runs once per block, not once
 /// per character.
-fn fallback_cache() -> &'static RwLock<std::collections::HashMap<(u32, FaceId), Option<FaceId>>> {
-    static CACHE: OnceLock<RwLock<std::collections::HashMap<(u32, FaceId), Option<FaceId>>>> = OnceLock::new();
+fn fallback_cache() -> &'static RwLock<std::collections::HashMap<(u32, FaceId, usize), Option<FaceId>>> {
+    static CACHE: OnceLock<RwLock<std::collections::HashMap<(u32, FaceId, usize), Option<FaceId>>>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
@@ -939,7 +947,7 @@ pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
             return f.id;
         }
     }
-    let key = (c as u32 >> 8, prefer);
+    let key = (c as u32 >> 8, prefer, database_revision());
     if let Some(cached) = fallback_cache().read().unwrap_or_else(|e| e.into_inner()).get(&key).copied() {
         match cached {
             Some(id) if face(id).has_char(c) => return id,
@@ -1265,6 +1273,74 @@ mod tests {
         let inter = resolve("Inter", "Regular").face;
         assert_ne!(fallback_for('\u{e000}', inter), id, "fallback never picks the empty glyph");
         assert_eq!(fallback_for('\u{e001}', inter), id, "fallback finds the drawn one");
+    }
+
+    /// A cached missing glyph must be retried when either registration API adds an unloaded
+    /// covering face. Each child uses only bundled/synthetic fonts and its own fallback cache.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn font_registration_refreshes_cached_fallback_misses() {
+        const CHILD: &str = "EFFECTCRAFT_TEST_REGISTERED_FALLBACK";
+        let Ok(mode) = std::env::var(CHILD) else {
+            let mut failures = Vec::new();
+            for mode in ["data", "source"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "fonts::tests::font_registration_refreshes_cached_fallback_misses", "--nocapture"])
+                    .env(CHILD, mode)
+                    .output()
+                    .unwrap();
+                eprintln!("{mode}:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                if !output.status.success() {
+                    failures.push(mode);
+                }
+            }
+            assert!(failures.is_empty(), "registration modes failed: {failures:?}");
+            return;
+        };
+        db().write().unwrap().scanned = true;
+        assert!(all_faces().iter().all(|f| f.info.origin == "bundled"));
+        let c = '\u{e001}';
+        assert_eq!(script_of(c), FallbackScript::Other);
+        let style = crate::TextStyle::default();
+        let primary = resolve(&style.family, &style.style).face;
+        let missing = crate::layout_text(&c.to_string(), &style, &Default::default());
+        assert!(!missing.glyphs.is_empty());
+        assert!(missing.glyphs.iter().all(|g| g.id == 0));
+        let key = (c as u32 >> 8, primary, database_revision());
+        assert_eq!(fallback_cache().read().unwrap().get(&key), Some(&None));
+        let previous_revision = database_revision();
+        let data = test_font("Registered Fallback Test");
+        let id = if mode == "data" {
+            add_font_data(data)[0]
+        } else {
+            assert_eq!(mode, "source");
+            struct Source(FaceInfo);
+            impl FontSource for Source {
+                fn faces(&self) -> Vec<FaceInfo> {
+                    vec![self.0.clone()]
+                }
+            }
+            let data = Arc::new(data);
+            let names = read_faces_bytes(&data).into_iter().next().unwrap();
+            assert_eq!(add_source(&Source(info_from(names, FaceData::Shared(data), "test"))), 1);
+            all_faces().last().unwrap().id
+        };
+        assert!(database_revision() > previous_revision);
+        assert!(fallback_cache().read().unwrap().get(&key).is_none(), "registration must clear cached searches");
+        // Model a pre-registration search that completes after the cache was cleared.
+        // Its old-revision miss must not poison the next layout's fallback search.
+        fallback_cache().write().unwrap().insert(key, None);
+        // Do not call has_char or font here: loading the face would bypass the stale miss.
+        assert!(face(id).bytes.get().is_none());
+        let refreshed = crate::layout_text(&c.to_string(), &style, &Default::default());
+        assert!(!Arc::ptr_eq(&missing, &refreshed), "the layout revision must change");
+        assert!(!refreshed.glyphs.is_empty());
+        assert!(
+            refreshed.glyphs.iter().all(|g| g.id != 0 && g.face == id),
+            "{mode}: refreshed layout must use the registered fallback, got {:?}",
+            refreshed.glyphs
+        );
+        assert_eq!(fallback_for(c, primary), id);
     }
 
     /// A Microsoft family that isn't installed renders in its installed metric-compatible
