@@ -408,3 +408,94 @@ fn audio_spectrum_follows_time_through_the_layer_cache() {
     assert!(lit(&fresh) > lit(&silent), "the tone draws more than the baseline: {} vs {}", lit(&fresh), lit(&silent));
     assert_eq!(cached.data, fresh.data, "cached {} px, uncached {} px", lit(&cached), lit(&fresh));
 }
+
+/// A normal export block can span more than the allocation cap at timelapse speeds.
+/// Check every interpolated sample, including source-page edges and nested compositions.
+#[test]
+fn strongly_stretched_audio_reads_bounded_chunks() {
+    struct Indexed(std::sync::atomic::AtomicUsize);
+    impl FootageSource for Indexed {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            None
+        }
+        fn audio(&self, _: ItemId, _: &Footage, start: Tick, frames: usize, rate: u32) -> Option<Vec<f32>> {
+            self.0.fetch_max(frames, std::sync::atomic::Ordering::Relaxed);
+            let first = start.to_units_floor(i64::from(rate));
+            Some(
+                (0..frames)
+                    .flat_map(|i| {
+                        let v = ((first + i as i64) % 257) as f32 / 257.0;
+                        [v, -v]
+                    })
+                    .collect(),
+            )
+        }
+    }
+    for rate in [44100, 48000] {
+        for speed in [65.0, 65.5355, 128.5] {
+            for nested in [false, true] {
+                let (mut p, inner) = comp_with(None, &[], false);
+                p.comp_mut(inner).unwrap().layers[0].out_point = Tick::from_seconds_f64(120.0);
+                let cid = if nested {
+                    let mut outer = Comp::new(64, 64, FrameRate::new(25, 1), Tick::from_seconds_f64(1.0));
+                    let layer = build::layer(&mut p, &outer, "nested", LayerSource::Comp { item: inner }, (64, 64), None);
+                    outer.layers.push(layer);
+                    p.add_item("outer", effectcraft_color::Label::Sandstone, None, ItemKind::Comp(outer.into()))
+                } else {
+                    inner
+                };
+                p.comp_mut(cid).unwrap().layers[0].stretch = 100.0 / speed;
+                let source = Indexed(std::sync::atomic::AtomicUsize::new(0));
+                let start = Tick::from_seconds_f64(0.1);
+                let first = p.comp(cid).unwrap().layers[0].layer_time(start).to_units_floor(i64::from(rate)) as usize;
+                let samples = mix_comp(&p, &source, None, cid, start, 16384, rate).unwrap();
+                for i in 0..16384 {
+                    let x = i as f64 * speed;
+                    let j = x as usize;
+                    let a = ((first + j) % 257) as f32 / 257.0;
+                    let b = ((first + j + 1) % 257) as f32 / 257.0;
+                    let expected = a + (b - a) * (x - j as f64) as f32;
+                    assert!((samples[i * 2] - expected).abs() < 1e-6, "rate={rate} speed={speed} nested={nested} sample={i}");
+                    assert_eq!(samples[i * 2], -samples[i * 2 + 1]);
+                }
+                assert!(source.0.load(std::sync::atomic::Ordering::Relaxed) <= 1_048_576);
+            }
+        }
+    }
+}
+
+/// Oversized stretched reads retain cumulative work limits and observe cancellation between pages.
+#[test]
+fn strongly_stretched_audio_retains_shared_limits() {
+    use crate::audio::{AudioError, MixControl, mix_comp_with_control};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct Stops {
+        cancel: Arc<AtomicBool>,
+        reads: AtomicUsize,
+        stop: bool,
+    }
+    impl FootageSource for Stops {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            None
+        }
+        fn audio(&self, _: ItemId, _: &Footage, _: Tick, frames: usize, _: u32) -> Option<Vec<f32>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.stop {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            Some(vec![0.25; frames * 2])
+        }
+    }
+    let (mut p, cid) = comp_with(None, &[], false);
+    p.comp_mut(cid).unwrap().layers[0].stretch = 1.0;
+    for stop in [false, true] {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let source = Stops { cancel: cancel.clone(), reads: AtomicUsize::new(0), stop };
+        let control = MixControl { cancel: Some(cancel), max_work: if stop { None } else { Some(1_638_400 + 32_768) }, ..Default::default() };
+        assert_eq!(
+            mix_comp_with_control(&p, &source, None, cid, Tick::ZERO, 16384, 48000, &control),
+            Err(if stop { AudioError::Cancelled } else { AudioError::WorkLimit })
+        );
+        assert_eq!(source.reads.load(Ordering::Relaxed), if stop { 1 } else { 24 }, "limits must stop source work early");
+    }
+}

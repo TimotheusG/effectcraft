@@ -218,6 +218,7 @@ fn evaluate_out(
             }
         }
     }
+    runtime::fail_audio();
     Err("Error: expression needs too many property reads".into())
 }
 

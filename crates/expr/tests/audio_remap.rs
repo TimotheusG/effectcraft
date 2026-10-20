@@ -269,3 +269,20 @@ fn cancellation_interrupts_nested_audio_parameters() {
         worker.join().unwrap();
     }
 }
+
+/// Property-read pass exhaustion is a resource failure, including when reached from audio.
+#[test]
+fn property_read_pass_limits_abort_audio_and_recover() {
+    // A fresh host request on each replay reaches the pass limit without a costly JS loop.
+    let text = "globalThis.audioPassProbe = (globalThis.audioPassProbe || 0) + 1; thisLayer.transform.opacity.valueAtTime(globalThis.audioPassProbe, true)";
+    let (p, cid) = workload::project(1, 0, Some(text));
+    let layer = &p.comp(cid).unwrap().layers[0];
+    let error = effectcraft_expr::eval_property(&p, cid, layer.id, "timeRemap", 0.0).unwrap_err();
+    assert!(error.contains("too many property reads"), "must exercise the pass limit: {error}");
+    let source = workload::Source::default();
+    let control = MixControl { max_expression_yields: Some(usize::MAX), max_duration: Some(std::time::Duration::from_secs(30)), ..Default::default() };
+    assert_eq!(mix_comp_with_control(&p, &source, Some(&Expressions), cid, Tick::ZERO, 2, 48000, &control), Err(AudioError::WorkLimit));
+    assert_eq!(source.reads.load(Ordering::Relaxed), 0);
+    let (p, cid) = workload::project(1, 0, Some("Math.sin(time)"));
+    assert!(mix_comp(&p, &source, Some(&Expressions), cid, Tick::ZERO, 32, 48000).is_ok());
+}

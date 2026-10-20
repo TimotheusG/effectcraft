@@ -296,6 +296,15 @@ impl MixEnv<'_> {
         let m = b - a;
         let speed = 100.0 / l.stretch;
         let src_n = ((m as f64 * speed).ceil() as usize).max(1);
+        if src_n > 1_048_576 {
+            // Paging removes the allocation limit, not the cumulative source-work allowance.
+            if src_n > self.budget.remaining.get() {
+                self.budget.error.set(Some(AudioError::WorkLimit));
+                return out;
+            }
+            self.large_stretched_raw(l, i0, a, b, speed, src_n, &mut out);
+            return out;
+        }
         if !self.budget.charge(src_n, self.footage) {
             return out;
         }
@@ -330,6 +339,59 @@ impl MixEnv<'_> {
             out[(a + i) * 2 + 1] = buf[j * 2 + 1] + (buf[k * 2 + 1] - buf[j * 2 + 1]) * f;
         }
         out
+    }
+
+    /// Stream oversized stretched reads without allocating their whole source span. Each page
+    /// includes the next sample for interpolation; nested mixes share the same work budget.
+    #[allow(clippy::too_many_arguments)]
+    fn large_stretched_raw(&self, l: &Layer, i0: i64, a: usize, b: usize, speed: f64, src_n: usize, out: &mut [f32]) {
+        const PAGE: usize = 65536;
+        let first = l.layer_time(sample_tick(i0 + a as i64, self.rate)).to_units_floor(i64::from(self.rate));
+        let mut cached = None;
+        let mut buf = Vec::new();
+        for i in 0..b - a {
+            if !self.budget.charge(0, self.footage) {
+                return;
+            }
+            let x = i as f64 * speed;
+            let j = (x as usize).min(src_n - 1);
+            let page = j / PAGE * PAGE;
+            if cached != Some(page) {
+                let frames = (src_n - page).min(PAGE + 1);
+                if !self.budget.charge(frames, self.footage) {
+                    return;
+                }
+                let Some(index) = i64::try_from(page).ok().and_then(|p| first.checked_add(p)) else {
+                    self.budget.error.set(Some(AudioError::WorkLimit));
+                    return;
+                };
+                let start = sample_tick(index, self.rate);
+                buf = match &l.source {
+                    LayerSource::Footage { item } => match self.project.item(*item).map(|i| &i.kind) {
+                        Some(ItemKind::Footage(f)) if f.has_audio => self.footage.audio(*item, f, start, frames, self.rate).unwrap_or_default(),
+                        _ => return,
+                    },
+                    LayerSource::Comp { item } => {
+                        if self.project.comp_contains(*item, self.comp_id) {
+                            return;
+                        }
+                        let mut sub = vec![0.0; frames * 2];
+                        mix_into(self.project, self.footage, self.expr, *item, start, self.rate, &mut sub, 1.0, 1.0, self.depth + 1, self.budget);
+                        sub
+                    }
+                    _ => return,
+                };
+                cached = Some(page);
+            }
+            let offset = (j - page) * 2;
+            let Some(pair) = buf.get(offset..offset + 2) else { return };
+            let next = buf.get(offset + 2..offset + 4).unwrap_or(pair);
+            let fraction = ((x - j as f64) as f32).clamp(0.0, 1.0);
+            let Some(target) = out.get_mut((a + i) * 2..(a + i) * 2 + 2) else { return };
+            for channel in 0..2 {
+                target[channel] = pair[channel] + (next[channel] - pair[channel]) * fraction;
+            }
+        }
     }
 
     /// Fetch bounded source pages, rather than decoding once per output sample or allocating
