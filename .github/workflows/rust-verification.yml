@@ -1,0 +1,108 @@
+name: Rust verification
+
+on:
+  pull_request:
+  push:
+    branches: [main, "sol-ci-candidate-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  standalone:
+    name: Standalone gate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/standalone
+      # Keep optimized tests while avoiding whole-program LTO on hosted runners.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Test the actual proposed head, not a moving branch or an implicit merge.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Linux native build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev libgl1-mesa-dev libegl1-mesa-dev libacl1-dev mesa-vulkan-drivers xvfb lsof
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache/restore@v4
+        id: rust-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/standalone
+          key: rust-${{ runner.os }}-${{ runner.arch }}-1.99.1-standalone-nolto-cgu16-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.cargo/config.toml') }}
+          restore-keys: rust-${{ runner.os }}-${{ runner.arch }}-1.99.1-standalone-nolto-cgu16-
+      - name: Record exact standalone head and toolchain
+        shell: bash
+        run: |
+          git rev-parse HEAD 'HEAD^{tree}' | tee standalone-source.txt
+          rustc -Vv
+          cargo -V
+      - name: Integration tooling regression tests
+        run: python -m unittest discover -s ci -p "test_*.py" -v
+      - name: Required repository gate (fmt, Clippy, tests, policies, WASM)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo xtask ci 2>&1 | tee cargo-xtask-ci.log
+      - name: Build desktop executable using the gate's compiled dependencies
+        # Cargo fingerprints decide whether any rebuild is needed; do not trust
+        # an existing executable from a different source revision.
+        run: cargo build --locked --release -p effectcraft
+      - name: Windows application entry smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python tools/native-smoke/smoke.py --binary "$env:CARGO_TARGET_DIR/release/effectcraft.exe" --out smoke-evidence
+      - name: macOS application entry smoke
+        if: runner.os == 'macOS'
+        run: python3 tools/native-smoke/smoke.py --binary "$CARGO_TARGET_DIR/release/effectcraft" --out smoke-evidence
+      - name: Linux application entry smoke
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python3 tools/native-smoke/smoke.py --binary "$CARGO_TARGET_DIR/release/effectcraft" --out smoke-evidence
+      - name: Ensure the gate did not change tracked sources or lockfile
+        if: always()
+        run: git diff --exit-code HEAD
+      - uses: actions/cache/save@v4
+        # Preserve completed dependency builds even when a genuine lint/test fails.
+        if: always() && steps.rust-cache.outputs.cache-primary-key != '' && steps.rust-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/standalone
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: standalone-source-${{ matrix.os }}
+          path: |
+            standalone-source.txt
+            cargo-xtask-ci.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-entry-${{ matrix.os }}-${{ github.sha }}
+          path: smoke-evidence

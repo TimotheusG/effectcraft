@@ -1,0 +1,40 @@
+# Integration proposal: install as .github/workflows/native-entry-smoke.yml.
+# Separate from export-filesystem.yml; no audio-device success claim on hosted runners.
+name: Native application entry smoke
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-entry:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev mesa-vulkan-drivers xvfb lsof
+      - run: cargo build --locked --release -p effectcraft
+      - if: runner.os == 'Windows'
+        run: python tools/native-smoke/smoke.py --binary target/release/effectcraft.exe --out smoke-evidence
+      - if: runner.os == 'macOS'
+        run: python3 tools/native-smoke/smoke.py --binary target/release/effectcraft --out smoke-evidence
+      - if: runner.os == 'Linux'
+        run: xvfb-run -a python3 tools/native-smoke/smoke.py --binary target/release/effectcraft --out smoke-evidence
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-entry-${{ runner.os }}
+          path: smoke-evidence

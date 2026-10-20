@@ -1,0 +1,96 @@
+name: Pinned companion integration
+
+# This explicit, manual assembly is supplementary evidence. It cannot replace a
+# failing standalone check on an individual PR.
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_path:
+        description: "Checked-out manifest path: pins all heads/worker patches; inspect snapshot status first"
+        type: string
+        default: ci/integration-heads.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: companion-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  combined:
+    name: Combined gate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      INTEGRATION_MANIFEST: ${{ inputs.manifest_path || 'ci/integration-heads.json' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Linux native build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev libgl1-mesa-dev libacl1-dev
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - name: Assemble exact heads, refuse moved PRs and unapproved conflicts
+        shell: bash
+        run: |
+          python ci/assemble_integration.py --source . --manifest "$INTEGRATION_MANIFEST" \
+            --destination "$RUNNER_TEMP/effectcraft-combined" \
+            --receipt "$RUNNER_TEMP/combined-source.json" --fetch --check-live
+          cp "$RUNNER_TEMP/combined-source.json" combined-source.json
+          cp "$INTEGRATION_MANIFEST" combined-manifest.json
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/effectcraft-combined-target" >> "$GITHUB_ENV"
+          rustc -Vv
+          cargo -V
+      - uses: actions/cache/restore@v4
+        id: rust-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/effectcraft-combined-target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-1.99.1-combined-nolto-cgu16-${{ hashFiles(inputs.manifest_path || 'ci/integration-heads.json') }}
+          restore-keys: rust-${{ runner.os }}-${{ runner.arch }}-1.99.1-combined-nolto-cgu16-
+      - name: Required gate on the recorded combined tree
+        working-directory: ${{ runner.temp }}/effectcraft-combined
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo xtask ci 2>&1 | tee cargo-xtask-ci.log
+      - name: Verify tested index and source still match the receipt
+        if: always()
+        shell: bash
+        run: python ci/verify_integration.py --receipt "$RUNNER_TEMP/combined-source.json"
+      - uses: actions/cache/save@v4
+        if: always() && steps.rust-cache.outputs.cache-primary-key != '' && steps.rust-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/effectcraft-combined-target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: combined-source-${{ matrix.os }}
+          path: |
+            combined-source.json
+            combined-manifest.json
+            ${{ runner.temp }}/effectcraft-combined/cargo-xtask-ci.log

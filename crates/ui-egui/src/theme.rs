@@ -409,7 +409,9 @@ fn install_script_fallbacks(family_fonts: &mut FontDefinitions, language: &str) 
         let mut names = Vec::new();
         let mut seen = Vec::new();
         for &(probe, name) in cjk.iter().chain(SCRIPT_PROBES).chain(std::iter::once(&HANGUL)) {
-            let id = fonts::fallback_for(probe, base);
+            // Another context may install a different language concurrently. Its global
+            // request must not choose the faces registered into this context.
+            let id = fonts::fallback_for_locale(probe, base, cjk_locale(language));
             if seen.contains(&id) {
                 continue;
             }
@@ -443,9 +445,9 @@ fn cjk_locale(language: &str) -> &str {
 }
 
 /// The Han character that picks the Chinese fallback face. A Simplified Chinese interface asks for
-/// a simplified-only hanzi: a Japanese face covers the shared ideographs (文) but not 页, 选 or 删,
-/// and the fallback takes a face already loaded first, so the Japanese face loaded for kana would
-/// draw the Chinese interface with boxes (#1141).
+/// a hanzi used by its catalog. Some Japanese faces also cover 页 while lacking 选 or 删, so
+/// coverage of this probe alone is not enough: the fallback must use the interface's own language
+/// policy, even while another context is installing Japanese fonts (#1141).
 #[cfg(not(target_arch = "wasm32"))]
 fn han_probe(language: &str) -> char {
     if language == "zh-hans" { '页' } else { '文' }
@@ -595,9 +597,9 @@ mod script_font_tests {
         }
     }
 
-    /// #1141: switching the interface to Simplified Chinese drew most labels as boxes. The English
-    /// interface had already loaded a Japanese face for kana, and that face covers the Han probe,
-    /// so it became the Chinese fallback too, without the simplified-only hanzi.
+    /// #1141: switching the interface to Simplified Chinese drew most labels as boxes. A Japanese face
+    /// can cover the Han probe while lacking other catalog characters. The context must keep its
+    /// own language policy even when another context installs Japanese fallbacks concurrently.
     #[test]
     fn simplified_chinese_interface_draws_simplified_hanzi_after_another_language() {
         let ctx = egui::Context::default();
@@ -609,7 +611,7 @@ mod script_font_tests {
         let font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
         let missing: String = ctx.fonts_mut(|fonts| {
             let replacement = fonts.layout_no_wrap("\u{10ffff}".into(), font.clone(), egui::Color32::WHITE).rows[0].glyphs[0].uv_rect;
-            // Simplified-only hanzi of the zh-hans catalog (选择, 删除, 图层, 设置, 导入, 页面).
+            // Representative hanzi of the zh-hans catalog (选择, 删除, 图层, 设置, 导入, 页面).
             "选删层设导页"
                 .chars()
                 .filter(|ch| {

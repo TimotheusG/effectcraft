@@ -1,0 +1,83 @@
+name: Native application entry smoke
+
+# Dispatch against the published candidate containing tools/native-smoke. This
+# checks real application entry points; device audio capture remains separate.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-entry-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-entry:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/native-smoke
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Linux native/window prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev mesa-vulkan-drivers libacl1-dev xvfb lsof
+      - uses: actions/cache/restore@v4
+        id: rust-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/native-smoke
+          key: rust-${{ runner.os }}-${{ runner.arch }}-1.99.1-native-nolto-cgu16-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: rust-${{ runner.os }}-${{ runner.arch }}-1.99.1-native-nolto-cgu16-
+      - name: Record candidate head and toolchain
+        shell: bash
+        run: |
+          git rev-parse HEAD 'HEAD^{tree}' | tee native-source.txt
+          rustc -Vv
+          cargo -V
+      - name: Build actual desktop executable
+        run: cargo build --locked --release -p effectcraft
+      - name: Windows application entry smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python tools/native-smoke/smoke.py --binary "$env:CARGO_TARGET_DIR/release/effectcraft.exe" --out smoke-evidence
+      - name: macOS application entry smoke
+        if: runner.os == 'macOS'
+        run: python3 tools/native-smoke/smoke.py --binary "$CARGO_TARGET_DIR/release/effectcraft" --out smoke-evidence
+      - name: Linux application entry smoke
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python3 tools/native-smoke/smoke.py --binary "$CARGO_TARGET_DIR/release/effectcraft" --out smoke-evidence
+      - uses: actions/cache/save@v4
+        if: always() && steps.rust-cache.outputs.cache-primary-key != '' && steps.rust-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/native-smoke
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-entry-${{ runner.os }}-${{ github.sha }}
+          path: |
+            native-source.txt
+            smoke-evidence

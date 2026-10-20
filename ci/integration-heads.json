@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/storytold/effectcraft.git",
+  "base": "ef74d82902ba486891b02afa87e42963cc9b84cc",
+  "pull_requests": [
+    {
+      "number": 1922,
+      "base": "ef74d82902ba486891b02afa87e42963cc9b84cc",
+      "head": "7fabc356804e093fb5dc00f660522602dc174714",
+      "title": "Preserve existing exports until encoding succeeds"
+    },
+    {
+      "number": 1889,
+      "base": "ef74d82902ba486891b02afa87e42963cc9b84cc",
+      "head": "4ba53e7545f6ee4958062453cda346fbdd9577b6",
+      "title": "test(engine): guard the Unix-only importer fixture"
+    },
+    {
+      "number": 1890,
+      "base": "ef74d82902ba486891b02afa87e42963cc9b84cc",
+      "head": "33b2320ac7a413caf8e9330e09abbd35e2b23316",
+      "title": "test(text): isolate metric-font fallback tests from host fonts"
+    },
+    {
+      "number": 1891,
+      "base": "ef74d82902ba486891b02afa87e42963cc9b84cc",
+      "head": "f667b6e11ec73c4bf3126a050de7b8c828b23e0b",
+      "title": "fix(script): interrupt blocked socket writes on close"
+    },
+    {
+      "number": 1907,
+      "base": "ef74d82902ba486891b02afa87e42963cc9b84cc",
+      "head": "d6afa87641e3f57d96d7431ef6a2b19b53467df4",
+      "title": "fix(text): isolate CJK fallback language and cache entries"
+    },
+    {
+      "number": 1915,
+      "base": "ef74d82902ba486891b02afa87e42963cc9b84cc",
+      "head": "c4505d34de24749a7784bac6f88c964e24a9d6cd",
+      "title": "test(render): make automatic backend checks independent of timing"
+    },
+    {
+      "number": 1916,
+      "base": "ef74d82902ba486891b02afa87e42963cc9b84cc",
+      "head": "ac787fcdc0b7b4e00cca0a0bc7a3ad41c8daf4c5",
+      "title": "test(ui): serialize Windows viewer screenshot harnesses"
+    },
+    {
+      "number": 1827,
+      "base": "ef74d82902ba486891b02afa87e42963cc9b84cc",
+      "head": "262d7aaef893ebf05bb2059c125a914c377bedea",
+      "title": "Audio: honor Time Remap in preview and export"
+    }
+  ],
+  "resolutions": [
+    {
+      "path": "crates/export/tests/render_settings.rs",
+      "strategy": "append-ours-to-theirs",
+      "stages": {
+        "1": "9e9a0a18f76c11f961327c82272635862683be1e",
+        "2": "1fc59d8983d0bfc821c05c5dbca83f0dbff42ebf",
+        "3": "acccf95151277c1e702d6b05e54dd21d8df18d18"
+      },
+      "result": "2cd474a2610a7ca0dc2ecdf38b03e1af3d48043b",
+      "reason": "The export side is a pure EOF append. Keep the complete audio-side file with its added comments/tests, then concatenate the exact export-side append. Automatic union was rejected by Rust syntax checks."
+    }
+  ],
+  "expected_tree": "5baca7023f17469b437e87135d4ae47f5fc29808"
+}
