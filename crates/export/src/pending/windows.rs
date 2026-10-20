@@ -84,7 +84,12 @@ impl Policy {
 
     /// Verify exactly the policy components captured for this output.
     pub fn matches(&self, path: &Path) -> io::Result<bool> {
-        Ok(Self::read_with_audit(path, self.audit)? == *self)
+        let actual = Self::read_with_audit(path, self.audit)?;
+        #[cfg(test)]
+        if actual != *self {
+            eprintln!("policy mismatch: expected {self:?}; actual {actual:?}");
+        }
+        Ok(actual == *self)
     }
 
     /// Full SACL reads require an already-enabled SeSecurityPrivilege; never silently
@@ -118,7 +123,10 @@ impl Policy {
         if sacl.is_some() {
             flags |= S::Label | S::Attribute | S::Scope;
         }
-        if self.audit {
+        // Setting a null SACL can materialize a different descriptor. Leave an absent
+        // SACL untouched; the full readback must still prove it matches the destination.
+        // Unexpected inherited audit entries therefore cause refusal, never silent loss.
+        if self.audit && sacl.is_some() {
             let protected_sacl = text.split("S:").nth(1).unwrap_or("").split('(').next().unwrap_or("").contains('P');
             flags |= S::Sacl | if protected_sacl { S::ProtectedSacl } else { S::UnprotectedSacl };
         }
