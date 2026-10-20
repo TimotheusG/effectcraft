@@ -393,7 +393,10 @@ mod tests {
             let staged = stage(&path, b"replacement");
             let private = w::GetNamedSecurityInfo(staged.temporary.as_os_str(), O::SE_FILE_OBJECT, S::Dacl).unwrap();
             let private_text = w::ConvertSecurityDescriptorToStringSecurityDescriptor(&private, S::Dacl).unwrap();
-            assert_eq!(private_text.to_string_lossy().replace("D:PAI", "D:P"), format!("D:P(A;;FA;;;{})", sid.to_string_lossy()));
+            // SDDL abbreviates well-known SIDs (for example S-1-5-32-544 becomes BA).
+            // Compare descriptors serialized by the same API rather than a numeric SID.
+            let restricted_text = w::ConvertSecurityDescriptorToStringSecurityDescriptor(&restricted, S::Dacl).unwrap();
+            assert_eq!(private_text.to_string_lossy().replace("D:PAI", "D:P"), restricted_text.to_string_lossy());
             staged.publish().unwrap();
             assert_eq!(platform::Policy::read(&path).unwrap(), expected);
             let staged = stage(&path, b"must not publish");
