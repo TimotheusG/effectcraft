@@ -232,7 +232,7 @@ fn scrub_reports_excessive_audio_work() {
         let start = std::time::Instant::now();
         let at = begin_scrub(&mut h);
         assert!(start.elapsed() < std::time::Duration::from_secs(3), "scrub must not retry per-sample timeouts");
-        let error = "audio mixing exceeded its work limit; simplify remapping or nested compositions";
+        let error = "audio mixing exceeded its work limit; simplify time stretching, remapping, or nested compositions";
         assert!(h.state().ui.status.contains(error));
         assert!(h.output().shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text().contains(error))), "visible error toast");
         assert!(h.state().session.time() > Tick::ZERO, "the gesture changed the current time");

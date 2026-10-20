@@ -46,7 +46,7 @@ impl std::fmt::Display for AudioError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Cancelled => "audio mixing cancelled",
-            Self::WorkLimit => "audio mixing exceeded its work limit; simplify remapping or nested compositions",
+            Self::WorkLimit => "audio mixing exceeded its work limit; simplify time stretching, remapping, or nested compositions",
         })
     }
 }
