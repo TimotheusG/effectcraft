@@ -1,0 +1,40 @@
+name: Windows audit observer experiment
+
+on:
+  push:
+    branches: ["sol-audit-observer-*"]
+    paths: ["ci/windows_audit_*.py", ".github/workflows/windows-audit-observer.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  observer:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Record exact fixture source and host
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force audit-evidence | Out-Null
+          git rev-parse HEAD | Set-Content audit-evidence/source.txt
+          Get-FileHash ci/windows_audit_api.py,ci/windows_audit_probe.py | Format-List | Out-File audit-evidence/hashes.txt
+          whoami /all | Out-File audit-evidence/token.txt
+          Get-Volume | Format-Table DriveLetter,FileSystem,FileSystemLabel | Out-File audit-evidence/volumes.txt
+      - name: Restricted writer and privileged observer matrix (ReplaceFile and TxF separate)
+        shell: pwsh
+        run: |
+          python ci/windows_audit_probe.py --output audit-evidence 2>&1 | Tee-Object audit-evidence/probe.log
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-audit-observer-${{ github.sha }}
+          path: audit-evidence
