@@ -905,9 +905,9 @@ fn fallback_cache() -> &'static RwLock<std::collections::HashMap<(u32, FaceId, u
     CACHE.get_or_init(Default::default)
 }
 
-/// The results of [`family_faces`], per script and preferred face.
-fn family_faces_cache() -> &'static RwLock<std::collections::HashMap<(FallbackScript, FaceId), Arc<Vec<FaceId>>>> {
-    static CACHE: OnceLock<RwLock<std::collections::HashMap<(FallbackScript, FaceId), Arc<Vec<FaceId>>>>> = OnceLock::new();
+/// The results of [`family_faces`], per script, preferred face and database revision.
+fn family_faces_cache() -> &'static RwLock<std::collections::HashMap<(FallbackScript, FaceId, usize), Arc<Vec<FaceId>>>> {
+    static CACHE: OnceLock<RwLock<std::collections::HashMap<(FallbackScript, FaceId, usize), Arc<Vec<FaceId>>>>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
@@ -967,7 +967,9 @@ pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
 /// for `script`, in the order they are tried, each in the style of `prefer`. For CJK, the other CJK
 /// languages' families follow in the locale's order.
 fn family_faces(script: FallbackScript, prefer: &Face) -> Arc<Vec<FaceId>> {
-    if let Some(faces) = family_faces_cache().read().unwrap_or_else(|e| e.into_inner()).get(&(script, prefer.id)) {
+    // Capture before any face snapshots; a late insertion must keep its original revision.
+    let key = (script, prefer.id, database_revision());
+    if let Some(faces) = family_faces_cache().read().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return faces.clone();
     }
     let order: Vec<FallbackScript> = match script {
@@ -982,7 +984,13 @@ fn family_faces(script: FallbackScript, prefer: &Face) -> Arc<Vec<FaceId>> {
     };
     let style = &prefer.info.style;
     let faces: Arc<Vec<FaceId>> = Arc::new(order.into_iter().flat_map(families_for).filter_map(|fam| resolve_in(fam, style)).map(|r| r.face).collect());
-    family_faces_cache().write().unwrap_or_else(|e| e.into_inner()).insert((script, prefer.id), faces.clone());
+    #[cfg(test)]
+    BEFORE_FAMILY_CACHE_INSERT.with_borrow_mut(|hook| {
+        if let Some(hook) = hook.take() {
+            hook();
+        }
+    });
+    family_faces_cache().write().unwrap_or_else(|e| e.into_inner()).insert(key, faces.clone());
     faces
 }
 
@@ -993,6 +1001,12 @@ fn system_fallback(c: char, style: &str) -> Option<FaceId> {
     let first = faces.iter().find(|f| f.info.origin != "bundled" && file_covers(f, c))?;
     let r = resolve_in(&first.info.family, style)?;
     Some(if face(r.face).has_char(c) { r.face } else { first.id })
+}
+
+#[cfg(test)]
+thread_local! {
+    // Pause one test thread after resolution, with no database/cache lock held.
+    static BEFORE_FAMILY_CACHE_INSERT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1273,6 +1287,63 @@ mod tests {
         let inter = resolve("Inter", "Regular").face;
         assert_ne!(fallback_for('\u{e000}', inter), id, "fallback never picks the empty glyph");
         assert_eq!(fallback_for('\u{e001}', inter), id, "fallback finds the drawn one");
+    }
+
+    /// A family-order search paused before publication must not poison later fallbacks when
+    /// registration clears the cache while that search is in flight.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn registration_during_family_search_preserves_preferred_fallback() {
+        const CHILD: &str = "EFFECTCRAFT_TEST_FAMILY_SEARCH_REGISTRATION";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "fonts::tests::registration_during_family_search_preserves_preferred_fallback", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            eprintln!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success());
+            return;
+        }
+        db().write().unwrap().scanned = true;
+        assert!(all_faces().iter().all(|f| f.info.origin == "bundled"));
+        let c = 'あ';
+        let triangle = |family| {
+            let mut data = test_font(family);
+            let table = data[12..12 + 8 * 16].as_chunks::<16>().0.iter().find(|t| &t[..4] == b"cmap").unwrap();
+            let cmap = u32::from_be_bytes(table[8..12].try_into().unwrap()) as usize + 12;
+            for (offset, value) in [(16, c as u16), (24, c as u16), (30, 2u16.wrapping_sub(c as u16))] {
+                data[cmap + offset..cmap + offset + 2].copy_from_slice(&value.to_be_bytes());
+            }
+            data
+        };
+        let unrelated = add_font_data(triangle("Unrelated Loaded Fallback"))[0];
+        assert!(face(unrelated).has_char(c), "load the lower-priority covering face first");
+        let primary = resolve(DEFAULT_FAMILY, "Regular").face;
+        let script = script_of(c);
+        assert_eq!(script, FallbackScript::Japanese);
+        let (ready, built) = std::sync::mpsc::sync_channel(0);
+        let (resume, paused) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            BEFORE_FAMILY_CACHE_INSERT.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    ready.send(()).unwrap();
+                    paused.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                }));
+            });
+            family_faces(script, &face(primary))
+        });
+        built.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let preferred = add_font_data(triangle("Yu Gothic"))[0];
+        assert!(face(preferred).bytes.get().is_none(), "do not preload the preferred face");
+        assert!(family_faces_cache().read().unwrap().is_empty(), "registration cleared the cache");
+        resume.send(()).unwrap();
+        assert!(worker.join().unwrap().is_empty(), "the paused search predates Yu Gothic");
+        assert_eq!(family_faces_cache().read().unwrap().len(), 1, "the old search actually published its empty list after registration");
+        assert_eq!(fallback_for(c, primary), preferred, "the late empty list must not send new requests to the unrelated loaded face");
+        let layout = crate::layout_text(&c.to_string(), &crate::TextStyle::default(), &Default::default());
+        assert!(!layout.glyphs.is_empty());
+        assert!(layout.glyphs.iter().all(|g| g.id != 0 && g.face == preferred));
     }
 
     /// A cached missing glyph must be retried when either registration API adds an unloaded
