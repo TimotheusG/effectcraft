@@ -41,6 +41,8 @@ impersonate = api(a, "ImpersonateLoggedOnUser", [w.HANDLE], w.BOOL)
 current_thread = api(k, "GetCurrentThread", [], w.HANDLE)
 open_thread_token = api(a, "OpenThreadToken", [w.HANDLE, w.DWORD, w.BOOL, c.POINTER(w.HANDLE)], w.BOOL)
 initialize_acl = api(a, "InitializeAcl", [c.c_void_p, w.DWORD, w.DWORD], w.BOOL)
+sid_to_text = api(a, "ConvertSidToStringSidW", [c.c_void_p, c.POINTER(c.c_void_p)], w.BOOL)
+get_dacl = api(a, "GetSecurityDescriptorDacl", [c.c_void_p, c.POINTER(w.BOOL), c.POINTER(c.c_void_p), c.POINTER(w.BOOL)], w.BOOL)
 
 
 
@@ -85,7 +87,9 @@ def impersonate_restricted_writer():
 
 def ordinary_capabilities(path, thread_token=False):
     # Permanently remove Security privilege, in addition to max-privilege removal.
-    win.privilege(4, False)
+    # Thread mode already removed it before impersonation; never reopen the
+    # high primary token for adjustment under the restricted effective token.
+    if not thread_token: win.privilege(4, False)
     admin, is_member, token = c.c_void_p(), w.BOOL(), w.HANDLE()
     check(sid_from_text("S-1-5-32-544", c.byref(admin)))
     if thread_token:
@@ -161,6 +165,31 @@ def set_audit(path, sddl, protected):
         if code: raise c.WinError(code)
     finally:
         win.free(sd)
+
+
+def prepare_owned_fixture_root(path):
+    """Make only this new synthetic root writable under ordinary effective rights.
+
+    Hosted runner Temp can inherit admin-only/high-integrity policy. Explicitly
+    grant this user and SYSTEM and set inheritable medium integrity before any
+    case files exist; no external directory or system policy is changed.
+    """
+    token, text, sd = w.HANDLE(), c.c_void_p(), c.c_void_p()
+    check(win.open_token(win.current(), 8, c.byref(token)))
+    try:
+        user = token_buffer(token, 1)
+        check(sid_to_text(c.c_void_p.from_buffer(user).value, c.byref(text)))
+        sddl = f"D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;{c.wstring_at(text)})S:(ML;OICI;NW;;;ME)"
+        check(win.convert_in(sddl, 1, c.byref(sd), None))
+        present, defaulted, dacl, sacl = w.BOOL(), w.BOOL(), c.c_void_p(), c.c_void_p()
+        check(get_dacl(sd, c.byref(present), c.byref(dacl), c.byref(defaulted)))
+        check(win.get_sacl(sd, c.byref(present), c.byref(sacl), c.byref(defaulted)))
+        code = win.set_security(str(path), 1, 4 | 0x80000000 | 0x10, None, None, dacl, sacl)
+        if code: raise c.WinError(code)
+    finally:
+        win.close(token)
+        if text: win.free(text)
+        if sd: win.free(sd)
 
 
 def writer(path, action, result, thread_token=False):
@@ -259,6 +288,7 @@ def main():
     try:
         win.privilege(2, True)
         with tempfile.TemporaryDirectory(prefix="effectcraft-audit-") as temp:
+            prepare_owned_fixture_root(Path(temp))
             for policy in ("explicit-unprotected", "explicit-protected", "empty", "null", "default", "inherited"):
                 for action in ("replace", "commit", "rollback", "kill"):
                     try:
