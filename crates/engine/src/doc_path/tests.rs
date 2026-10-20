@@ -40,7 +40,6 @@ struct Stills;
 
 #[cfg(unix)]
 impl crate::Importer for Stills {
-    /// Treat an existing test file as a still image without decoding its bytes.
     fn probe(&self, path: &str) -> Result<Footage, String> {
         if !std::path::Path::new(path).is_file() {
             return Err(format!("{path}: no such file"));
