@@ -235,8 +235,19 @@ fn scrub_reports_excessive_audio_work() {
         let feed = fake.0.lock().unwrap().0.clone().unwrap();
         assert_eq!(feed.queued_frames(), 0);
         assert!(feed.error().is_some());
+        // Use a separate app/device so the gesture cannot inherit the direct call's error.
+        let project = app.session.project.clone();
+        let expr = app.session.expr.clone();
+        drop(app);
+        let fake = Fake::default();
+        let (mut app, fresh_cid) = setup(true, &fake);
+        assert_eq!(fresh_cid, cid);
+        app.session.project = project;
+        app.session.expr = expr;
         let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_| app);
         h.run_steps(3);
+        assert!(h.state().ui.status.is_empty(), "the drag starts without a prior error");
+        assert!(fake.0.lock().unwrap().0.is_none(), "the drag starts with no prior audio feed");
         let start = std::time::Instant::now();
         let at = begin_scrub(&mut h);
         assert!(start.elapsed() < std::time::Duration::from_secs(3), "scrub must not retry per-sample timeouts");
