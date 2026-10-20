@@ -23,18 +23,27 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
+      CARGO_BUILD_JOBS: "2"
       CARGO_PROFILE_RELEASE_LTO: "false"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
-      - name: Native filesystem contract
-        if: runner.os != 'Windows'
-        run: cargo test --locked --release -p effectcraft-export --lib pending::native
+      - name: Record exact source and toolchain
+        shell: bash
+        run: |
+          git rev-parse HEAD 'HEAD^{tree}'
+          rustc -Vv
+          cargo -V
+      - name: Ordinary export unit and filesystem contracts
+        # Run the complete library suite so a retired module/filter cannot match zero tests.
+        run: cargo test --locked --release -p effectcraft-export --lib
       - name: Export integration
-        if: runner.os != 'Windows'
         run: cargo test --locked --release -p effectcraft-export --test render_settings
-      - name: Windows audit-safe replacement and unprivileged refusal
-        if: runner.os == 'Windows'
-        run: cargo run --locked --release -p effectcraft-export --example windows_audit_tests
+      - name: Ensure tests did not change tracked sources or lockfile
+        if: always()
+        run: git diff --exit-code HEAD

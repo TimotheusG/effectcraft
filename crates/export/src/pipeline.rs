@@ -105,6 +105,7 @@ pub(crate) struct Cx<'a> {
     /// Files written to an overflow folder.
     pub overflowed: Mutex<Vec<String>>,
     pub pending: crate::pending::Pending,
+    pub authorization: Option<&'a serde_json::Value>,
 }
 
 impl<'a> std::ops::Deref for Cx<'a> {
@@ -152,7 +153,7 @@ impl<'a> Cx<'a> {
         let cache = LayerCache::default();
         // With deferred readbacks, buffers computed from a missed pass's placeholders are not kept.
         cache.set_gate(job.accel.and_then(|a| a.miss_gate()));
-        Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]), pending: crate::pending::Pending::default() }
+        Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]), pending: crate::pending::Pending::default(), authorization: None }
     }
 
     pub fn comp(&self) -> Option<&Comp> {
@@ -294,7 +295,7 @@ impl<'a> Cx<'a> {
 
     /// Stage media under this job's ownership; final paths remain unchanged until publication.
     pub fn create(&self, path: &str) -> crate::Result<out::Out<'_>> {
-        self.pending.create(self.sink, path)
+        self.pending.create_authorized(self.sink, path, self.authorization)
     }
 
     /// Where a file goes: `path`, or (Use Storage Overflow) the first overflow folder with room
@@ -356,7 +357,7 @@ impl<'a> Cx<'a> {
                 s.push_str(&format!("  Frame {} ({:.3} s): rendered in {:.1} ms\n", f0 + i as i64, t.seconds(), secs * 1000.0));
             }
         }
-        let mut f = out::create(self.sink, &path).ok()?;
+        let (mut f, path) = out::create_log(self.sink, &path).ok()?;
         std::io::Write::write_all(&mut f, s.as_bytes()).ok()?;
         f.finish().ok()?;
         Some(path)

@@ -1,5 +1,5 @@
-//! Render Settings and Output Module features end to end (through a [`Sink`], so nothing touches
-//! the disk): field rendering and 3:2 pulldown, crop / region of interest / resize, alpha-only
+//! Render Settings and Output Module features end to end, through a [`Sink`] and native
+//! temporary files: field rendering and 3:2 pulldown, crop / region of interest / resize, alpha-only
 //! and premultiplied output, the solo and guide-layer overrides, the render log, storage
 //! overflow, PCM audio formats and the compositor a job renders on.
 
@@ -17,6 +17,29 @@ use effectcraft_time::{FrameRate, Tick};
 
 const W: u32 = 64;
 const H: u32 = 48;
+
+fn disk_job<'a>(p: &'a Project, cid: ItemId, settings: &'a RenderSettings, output: &'a OutputModule, path: &'a str) -> Job<'a> {
+    Job {
+        project: p,
+        footage: &NoFootage,
+        expr: None,
+        accel: None,
+        comp: cid,
+        settings,
+        output,
+        path,
+        sink: None,
+        nested_switches: true,
+        options: JobOptions::default(),
+    }
+}
+
+/// Tests intentionally overwriting an old export use the same review/acceptance API
+/// as an interactive host.
+fn export_reviewed(job: &Job<'_>, progress: &mut dyn FnMut(&effectcraft_export::Progress) -> bool) -> effectcraft_export::Result<Report> {
+    let reviewed = effectcraft_export::preflight(job)?;
+    effectcraft_export::export_authorized(job, &reviewed.authorization, progress)
+}
 
 /// A comp at `rate`, black, with a white bar 8 px wide sweeping left to right (64 px/s) and a
 /// static red block at the bottom left; `extra` adds layers.
@@ -479,7 +502,6 @@ fn a_job_renders_on_one_compositor() {
 
 /// Cancellation after an encoder has opened its output must preserve the prior export.
 #[test]
-#[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
 fn cancelled_replacement_preserves_existing_movie_and_sequence() {
     let dir = std::env::temp_dir().join(format!("ec-preserve-export-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -489,7 +511,7 @@ fn cancelled_replacement_preserves_existing_movie_and_sequence() {
         let path = dir.join(if format.is_sequence() { "existing_[#####].png" } else { "existing.mp4" });
         let final_path = if format.is_sequence() { dir.join("existing_00000.png") } else { path.clone() };
         std::fs::write(&final_path, b"previous complete export").unwrap();
-        let result = export(
+        let result = export_reviewed(
             &Job {
                 project: &p,
                 footage: &NoFootage,
@@ -516,7 +538,6 @@ fn cancelled_replacement_preserves_existing_movie_and_sequence() {
 /// A complete two-second export matches the sink output byte-for-byte, both for a new
 /// destination and a replacement. This exercises the real muxer and parallel sequence path.
 #[test]
-#[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
 fn published_movie_and_sequence_match_complete_sink_outputs() {
     let dir = tempfile::tempdir().unwrap();
     let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
@@ -532,7 +553,7 @@ fn published_movie_and_sequence_match_complete_sink_outputs() {
                     std::fs::write(name, b"previous export").unwrap();
                 }
             }
-            let result = export(
+            let result = export_reviewed(
                 &Job {
                     project: &p,
                     footage: &NoFootage,
@@ -561,9 +582,8 @@ fn published_movie_and_sequence_match_complete_sink_outputs() {
     }
 }
 
-/// An I/O failure after a sequence starts must also preserve all earlier complete outputs.
+/// An invalid overflow destination must preserve all earlier complete outputs.
 #[test]
-#[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
 fn sequence_write_failure_preserves_existing_frames() {
     let dir = tempfile::tempdir().unwrap();
     let blocked = dir.path().join("blocked-overflow");
@@ -581,7 +601,7 @@ fn sequence_write_failure_preserves_existing_frames() {
     }
     let storage = FailAfterFirst(AtomicUsize::new(0));
     let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
-    let result = export(
+    let result = export_reviewed(
         &Job {
             project: &p,
             footage: &NoFootage,
@@ -603,4 +623,228 @@ fn sequence_write_failure_preserves_existing_frames() {
     }
     assert_eq!(std::fs::read(blocked).unwrap(), b"ordinary file, not a directory");
     assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".effectcraft-")));
+}
+
+/// Lose a completed staging file immediately before publication through the real export
+/// entry point. Preparation must reject the whole set, including every surviving frame.
+#[test]
+fn sequence_preparation_failure_publishes_no_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("movie_[#####].png");
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let mut injected = false;
+    let result = export(
+        &Job {
+            project: &p,
+            footage: &NoFootage,
+            expr: None,
+            accel: None,
+            comp: cid,
+            settings: &RenderSettings::default(),
+            output: &OutputModule::for_format(OutputFormat::PngSequence),
+            path: path.to_str().unwrap(),
+            sink: None,
+            nested_switches: true,
+            options: JobOptions::default(),
+        },
+        &mut |progress| {
+            if progress.done == progress.total && progress.total > 0 {
+                let mut staging = std::fs::read_dir(dir.path()).unwrap().next().unwrap().unwrap().path();
+                if staging.is_dir() {
+                    staging = std::fs::read_dir(staging).unwrap().next().unwrap().unwrap().path();
+                }
+                std::fs::remove_file(staging).unwrap();
+                injected = true;
+            }
+            true
+        },
+    );
+    assert!(injected);
+    assert!(matches!(result, Err(effectcraft_export::ExportError::Io(_))), "{result:?}");
+    // Failure logs have their separate, existing delivery contract. No frame or staging
+    // file may remain; the only entry is the useful error log.
+    let log = std::path::PathBuf::from(log_path(path.to_str().unwrap()));
+    assert!(std::fs::read_to_string(&log).unwrap().contains("before publication"));
+    let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert_eq!(entries, vec![log]);
+}
+
+#[test]
+fn preflight_is_read_only_and_authorized_new_movie_matches_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing").join("subfolder").join("movie.mov");
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let settings = custom(0.0, 0.08);
+    let output = OutputModule::for_format(OutputFormat::Uncompressed);
+    let job = disk_job(&p, cid, &settings, &output, path.to_str().unwrap());
+    let reviewed = effectcraft_export::preflight(&job).unwrap();
+    assert!(reviewed.collisions.is_empty());
+    assert!(!path.parent().unwrap().exists(), "inspection must not create folders");
+    let expected = run(&p, cid, &settings, &output, job.path);
+    effectcraft_export::export_authorized(&job, &reviewed.authorization, &mut |_| true).unwrap();
+    for (name, bytes) in expected.lock().unwrap().iter() {
+        assert_eq!(&std::fs::read(name).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn existing_output_requires_confirmation_and_stale_review_preserves_external_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("movie.mov");
+    std::fs::write(&path, b"old complete movie").unwrap();
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let settings = custom(0.0, 0.08);
+    let output = OutputModule::for_format(OutputFormat::Uncompressed);
+    let job = disk_job(&p, cid, &settings, &output, path.to_str().unwrap());
+    let reviewed = effectcraft_export::preflight(&job).unwrap();
+    assert_eq!(reviewed.collisions, vec![job.path]);
+    let mut progressed = false;
+    let error = export(&job, &mut |_| {
+        progressed = true;
+        true
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("confirmation required"), "{error}");
+    assert!(!progressed);
+    assert_eq!(std::fs::read(&path).unwrap(), b"old complete movie");
+    std::fs::write(&path, b"external writer changed this after review").unwrap();
+    let error = effectcraft_export::export_authorized(&job, &reviewed.authorization, &mut |_| true).unwrap_err().to_string();
+    assert!(error.contains("changed since preflight"), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"external writer changed this after review");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn file_appearing_after_job_validation_is_not_an_approved_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("movie_[#####].png");
+    let external = dir.path().join("movie_00000.png");
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let settings = custom(0.0, 0.08);
+    let output = OutputModule::for_format(OutputFormat::PngSequence);
+    let job = disk_job(&p, cid, &settings, &output, path.to_str().unwrap());
+    let reviewed = effectcraft_export::preflight(&job).unwrap();
+    let mut injected = false;
+    let error = effectcraft_export::export_authorized(&job, &reviewed.authorization, &mut |progress| {
+        if progress.done == 0 && !injected {
+            // export_inner has checked every target; the first staging open has not run.
+            std::fs::write(&external, b"external creator").unwrap();
+            injected = true;
+        }
+        true
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(injected);
+    assert!(error.contains("changed since preflight"), "{error}");
+    assert_eq!(std::fs::read(&external).unwrap(), b"external creator");
+    assert!(!dir.path().join("movie_00001.png").exists());
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".effectcraft-")));
+}
+
+#[test]
+fn authorization_cannot_be_reused_for_an_unreviewed_path_or_replaced_by_a_boolean() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.mov");
+    let b = dir.path().join("unreviewed").join("b.mov");
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let settings = custom(0.0, 0.08);
+    let output = OutputModule::for_format(OutputFormat::Uncompressed);
+    let a_job = disk_job(&p, cid, &settings, &output, a.to_str().unwrap());
+    let b_job = disk_job(&p, cid, &settings, &output, b.to_str().unwrap());
+    let reviewed = effectcraft_export::preflight(&a_job).unwrap();
+    let error = effectcraft_export::export_authorized(&b_job, &reviewed.authorization, &mut |_| true).unwrap_err().to_string();
+    assert!(error.contains("was not reviewed"), "{error}");
+    let error = effectcraft_export::export_authorized(&a_job, &serde_json::json!(true), &mut |_| true).unwrap_err().to_string();
+    assert!(error.contains("invalid export authorization"), "{error}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn skip_existing_does_not_hide_an_overflow_replacement() {
+    struct Overflow;
+    impl StorageQuota for Overflow {
+        fn has_room(&self, path: &str, _: u64) -> bool {
+            path.contains("overflow")
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let overflow = dir.path().join("overflow");
+    std::fs::create_dir(&overflow).unwrap();
+    let path = dir.path().join("movie_[#####].png");
+    let existing = overflow.join("movie_00000.png");
+    std::fs::write(&existing, b"old overflow frame").unwrap();
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let settings = RenderSettings { skip_existing: true, storage_overflow: true, ..custom(0.0, 0.04) };
+    let output = OutputModule::for_format(OutputFormat::PngSequence);
+    let mut job = disk_job(&p, cid, &settings, &output, path.to_str().unwrap());
+    job.options.storage = Some(&Overflow);
+    job.options.overflow = vec![overflow.to_str().unwrap().to_string()];
+    let reviewed = effectcraft_export::preflight(&job).unwrap();
+    assert_eq!(reviewed.collisions, vec![existing.to_str().unwrap()]);
+    assert!(export(&job, &mut |_| true).unwrap_err().to_string().contains("confirmation required"));
+    let base = dir.path().join("movie_00000.png");
+    std::fs::write(&base, b"already rendered").unwrap();
+    let permissions = std::fs::metadata(&base).unwrap().permissions();
+    let mut readonly = permissions.clone();
+    readonly.set_readonly(true);
+    std::fs::set_permissions(&base, readonly).unwrap();
+    let reviewed = effectcraft_export::preflight(&job).unwrap();
+    assert!(reviewed.collisions.is_empty());
+    assert_eq!(export(&job, &mut |_| true).unwrap().bytes, 0);
+    std::fs::set_permissions(&base, permissions).unwrap();
+    assert_eq!(std::fs::read(existing).unwrap(), b"old overflow frame");
+}
+
+#[test]
+fn render_log_collision_preserves_existing_file_and_returns_unique_paths() {
+    for hardlink in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.mov");
+        let wanted = std::path::PathBuf::from(log_path(path.to_str().unwrap()));
+        let unrelated = dir.path().join("unrelated-project.ecproj");
+        std::fs::write(&unrelated, b"unrelated project bytes").unwrap();
+        if hardlink {
+            std::fs::hard_link(&unrelated, &wanted).unwrap();
+        } else {
+            std::fs::write(&wanted, b"previous render log").unwrap();
+        }
+        let original = std::fs::read(&wanted).unwrap();
+        let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+        let settings = custom(0.0, 0.08);
+        let output = OutputModule::for_format(OutputFormat::Uncompressed);
+        let mut job = disk_job(&p, cid, &settings, &output, path.to_str().unwrap());
+        job.options.log = RenderLog::PlusSettings;
+        let first = export(&job, &mut |_| true).unwrap().log.unwrap();
+        assert_eq!(std::fs::read(&wanted).unwrap(), original);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated project bytes");
+        assert_ne!(std::path::Path::new(&first), wanted);
+        let first_bytes = std::fs::read(&first).unwrap();
+        std::fs::remove_file(&path).unwrap(); // Only this fixture's newly exported movie.
+        let second = export(&job, &mut |_| true).unwrap().log.unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(first).unwrap(), first_bytes);
+        assert_eq!(std::fs::read(wanted).unwrap(), original);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn render_log_symlink_does_not_follow_or_truncate_an_unrelated_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("movie.mov");
+    let wanted = std::path::PathBuf::from(log_path(path.to_str().unwrap()));
+    let unrelated = dir.path().join("unrelated-project.ecproj");
+    std::fs::write(&unrelated, b"unrelated project bytes").unwrap();
+    std::os::unix::fs::symlink(&unrelated, &wanted).unwrap();
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let settings = custom(0.0, 0.08);
+    let output = OutputModule::for_format(OutputFormat::Uncompressed);
+    let mut job = disk_job(&p, cid, &settings, &output, path.to_str().unwrap());
+    job.options.log = RenderLog::PlusSettings;
+    let actual = export(&job, &mut |_| true).unwrap().log.unwrap();
+    assert_ne!(std::path::Path::new(&actual), wanted);
+    assert_eq!(std::fs::read_link(&wanted).unwrap(), unrelated);
+    assert_eq!(std::fs::read(&wanted).unwrap(), b"unrelated project bytes");
 }

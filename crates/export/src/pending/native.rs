@@ -1,172 +1,198 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File, Metadata},
     io,
     path::{Path, PathBuf},
     time::SystemTime,
 };
 
-#[cfg(unix)]
-#[path = "unix.rs"]
-mod platform;
-
-// Serialize validation and replacement across jobs in this process. External writers still
-// require cooperation: portable filesystems do not provide compare-and-swap by file version.
-static PUBLICATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
-#[cfg(windows)]
-#[path = "windows.rs"]
-mod platform;
+// Coordinate this process's exports. Uncooperating external writers can still race
+// the final version check; ordinary filesystem replacement is not compare-and-swap.
+pub(super) static PUBLICATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(super) struct Staged {
-    temporary: tempfile::TempPath,
-    directory: Option<tempfile::TempDir>,
+    temporary: Option<tempfile::TempPath>,
     pub path: PathBuf,
     requested: PathBuf,
-    original: Option<Version>,
-    policy: platform::Policy,
-    parent_policy: platform::Policy,
+    original: serde_json::Value,
 }
 
-#[derive(PartialEq, Eq)]
-struct Version {
-    identity: (u64, u64),
-    change_stamp: (i64, i64),
-    len: u64,
-    modified: SystemTime,
-    policy: platform::Policy,
+/// Inspect ordinary metadata for confirmation without opening the destination for writing.
+pub(super) fn inspect(path: &str) -> io::Result<(String, serde_json::Value, bool)> {
+    let requested = requested_path(path)?;
+    let key = unicode(&requested)?.to_string();
+    let resolved = resolve(&requested, false)?;
+    let parent = resolved.parent().ok_or_else(|| io::Error::other("output has no parent directory"))?;
+    let (_, anchor) = canonical_parent(parent)?;
+    let state = readable_state(&resolved)?;
+    let existing = !state.is_null();
+    Ok((
+        key,
+        serde_json::json!({
+            "resolved": unicode(&resolved)?, "state": state,
+            "anchor": unicode(&anchor)?, "anchorPolicy": permissions_key(&fs::metadata(&anchor)?),
+        }),
+        existing,
+    ))
 }
 
-impl Version {
-    /// Capture the writable destination's identity, content timestamp, and access policy.
-    fn read(file: &File, path: &Path) -> io::Result<Self> {
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || platform::links(file)? != 1 {
-            return Err(io::Error::other(format!("export destination must be a regular file with one hard link: {}", path.display())));
+pub(super) fn validate_approval(path: &str, authorization: Option<&serde_json::Value>) -> io::Result<()> {
+    let requested = requested_path(path)?;
+    let resolved = resolve(&requested, false)?;
+    let Some(authorization) = authorization else {
+        return match fs::symlink_metadata(&resolved) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other(format!("overwrite confirmation required for {}", requested.display()))),
+        };
+    };
+    let targets = crate::preflight::token_targets(authorization)?;
+    let entry = targets.get(unicode(&requested)?).ok_or_else(|| io::Error::other(format!("export destination was not reviewed: {}", requested.display())))?;
+    if entry.get("resolved").and_then(serde_json::Value::as_str) != Some(unicode(&resolved)?) || entry.get("state") != Some(&readable_state(&resolved)?) {
+        return Err(io::Error::other(format!("export destination changed since preflight: {}", requested.display())));
+    }
+    let anchor = entry
+        .get("anchor")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| path.len() <= 65_536)
+        .ok_or_else(|| io::Error::other("invalid export authorization directory"))?;
+    if entry.get("anchorPolicy") != Some(&permissions_key(&fs::metadata(anchor)?)) {
+        return Err(io::Error::other("export directory policy changed since preflight"));
+    }
+    Ok(())
+}
+
+fn unicode(path: &Path) -> io::Result<&str> {
+    path.to_str().filter(|path| path.len() <= 65_536).ok_or_else(|| io::Error::other("export preflight resolved path is non-Unicode or exceeds 65536 bytes"))
+}
+
+fn requested_path(path: &str) -> io::Result<PathBuf> {
+    if path.len() > 65_536 {
+        return Err(io::Error::other("export preflight path exceeds 65536 bytes"));
+    }
+    std::path::absolute(path)
+}
+
+fn readable_state(path: &Path) -> io::Result<serde_json::Value> {
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        match fs::OpenOptions::new().access_mode(0).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(serde_json::Value::Null),
+            Err(error) => return Err(error),
         }
-        Ok(Self {
-            identity: platform::identity(file)?,
-            change_stamp: platform::change_stamp(file)?,
-            len: metadata.len(),
-            modified: metadata.modified()?,
-            policy: platform::Policy::read_existing(path)?,
-        })
+    };
+    #[cfg(windows)]
+    let metadata = file.metadata()?;
+    #[cfg(not(windows))]
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(serde_json::Value::Null),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() {
+        return Err(io::Error::other("export destination must be a regular file"));
+    }
+    #[cfg(windows)]
+    let identity = {
+        let info = winapi_util::file::information(&file)?;
+        (info.volume_serial_number(), info.file_index())
+    };
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(unix)]
+    let change = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.ctime(), metadata.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let change = timestamp(metadata.created()?);
+    Ok(serde_json::json!({
+        "identity": identity, "change": change, "len": metadata.len(),
+        "modified": timestamp(metadata.modified()?), "permissions": permissions_key(&metadata),
+    }))
+}
+
+fn timestamp(time: SystemTime) -> (bool, u64, u32) {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => (false, duration.as_secs(), duration.subsec_nanos()),
+        Err(error) => (true, error.duration().as_secs(), error.duration().subsec_nanos()),
     }
 }
 
+fn permissions_key(metadata: &Metadata) -> serde_json::Value {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        serde_json::json!(metadata.permissions().mode())
+    }
+    #[cfg(not(unix))]
+    serde_json::json!(metadata.permissions().readonly())
+}
+
 impl Staged {
-    /// Check destination capabilities before creating private, job-owned media storage.
+    /// Encode into a unique sibling created by tempfile; never truncate a final path.
     pub fn create(path: &str) -> io::Result<(Self, File)> {
-        let requested = std::path::absolute(path)?;
+        let requested = requested_path(path)?;
         let path = resolve(&requested, true)?;
+        let original = readable_state(&path)?;
         let parent = path.parent().ok_or_else(|| io::Error::other("output has no parent directory"))?;
-        let parent_policy = platform::Policy::read(parent)?;
-        match fs::metadata(&path) {
-            Ok(metadata) if !metadata.is_file() => return Err(io::Error::other("export destination is not a regular file")),
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-            _ => {}
-        }
-        let original = match OpenOptions::new().write(true).open(&path) {
-            Ok(file) => {
-                let version = Version::read(&file, &path)?;
-                Some(version)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        // The ordinary creation probe is always empty. No exported bytes ever enter an inode
-        // that another account might have opened before access was restricted.
-        let probe = platform::ordinary_file(parent)?;
-        if original.is_none() {
-            // Reject unsupported no-clobber publication before rendering. The probe contains
-            // no media; the owned directory also cleans its link on an early return.
-            let links = tempfile::Builder::new().prefix(".effectcraft-policy-").tempdir_in(parent)?;
-            fs::hard_link(probe.path(), links.path().join("link"))
-                .map_err(|error| io::Error::new(error.kind(), format!("export filesystem cannot publish new files with hard links: {error}")))?;
-            links.close()?;
-        }
-        let policy = match &original {
-            Some(version) => version.policy.clone(),
-            None => platform::Policy::read(probe.path())?,
-        };
-        policy.apply(probe.path())?;
-        if !policy.matches(probe.path())? {
-            return Err(io::Error::other("cannot preserve export destination access policy on this filesystem"));
-        }
-        probe.close()?;
-        let (temporary, directory) = platform::private_file(parent)?;
-        let (file, temporary) = temporary.into_parts();
-        let staged = Self { temporary, directory, path, requested, original, policy, parent_policy };
+        let (file, temporary) = tempfile::Builder::new().prefix(".effectcraft-export-").tempfile_in(parent)?.into_parts();
+        let staged = Self { temporary: Some(temporary), path, requested, original };
         staged.validate()?;
         Ok((staged, file))
     }
 
-    /// Reject changed links, destination versions, or parent access policy.
     pub fn validate(&self) -> io::Result<()> {
-        if resolve(&self.requested, false)? != self.path {
-            return Err(io::Error::other("export destination symlink changed while rendering"));
-        }
-        let parent = self.path.parent().ok_or_else(|| io::Error::other("output has no parent directory"))?;
-        if platform::Policy::read(parent)? != self.parent_policy {
-            return Err(io::Error::other("export directory access policy changed while rendering"));
-        }
-        match &self.original {
-            Some(expected) => {
-                let current = OpenOptions::new().write(true).open(&self.path)?;
-                if Version::read(&current, &self.path)? != *expected {
-                    return Err(io::Error::other(format!("export destination changed while rendering: {}", self.path.display())));
-                }
-            }
-            None => match fs::symlink_metadata(&self.path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-                Ok(_) => return Err(io::Error::other(format!("export destination appeared while rendering: {}", self.path.display()))),
-            },
+        if resolve(&self.requested, false)? != self.path || readable_state(&self.path)? != self.original {
+            return Err(io::Error::other(format!("export destination changed while rendering: {}", self.path.display())));
         }
         Ok(())
     }
 
-    /// Serialize final validation/publication and clean staging even when publication fails.
-    pub fn publish(self) -> io::Result<()> {
-        let result = {
-            let _publication = PUBLICATION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.publish_inner()
-        };
-        let cleanup = self.discard();
-        match (result, cleanup) {
-            (Err(error), Err(cleanup)) => Err(io::Error::new(error.kind(), format!("{error}; cleanup also failed: {cleanup}"))),
-            (Err(error), _) | (_, Err(error)) => Err(error),
-            _ => Ok(()),
-        }
-    }
-
-    /// Restore access policy and publish one complete file without clobbering a new creator.
-    fn publish_inner(&self) -> io::Result<()> {
+    /// Check every completed staging file before the first sequence publication.
+    pub fn prepare(&self) -> io::Result<()> {
         self.validate()?;
-        self.policy.apply(&self.temporary)?;
-        if !self.policy.matches(&self.temporary)? {
-            return Err(io::Error::other("staged export access policy could not be preserved"));
-        }
-        self.validate()?;
-        if self.original.is_some() {
-            fs::rename(&self.temporary, &self.path)?;
-        } else {
-            // Unlike a check followed by rename, this cannot overwrite a file that appeared
-            // after validation. Both names refer to complete bytes until staging is removed.
-            fs::hard_link(&self.temporary, &self.path)?;
+        let temporary = self.temporary.as_ref().ok_or_else(|| io::Error::other("export staging file already published"))?;
+        if !fs::metadata(temporary)?.is_file() {
+            return Err(io::Error::other("export staging path is not a regular file"));
         }
         Ok(())
     }
 
-    /// Remove only owned staging paths; a successful rename already consumed the file path.
+    /// Delegate same-directory publication and ordinary overwrite semantics to tempfile.
+    pub fn publish_prepared(&mut self) -> io::Result<()> {
+        self.validate()?;
+        let temporary = self.temporary.take().ok_or_else(|| io::Error::other("export staging file already published"))?;
+        let result = if self.original.is_null() { temporary.persist_noclobber(&self.path) } else { temporary.persist(&self.path) };
+        if let Err(error) = result {
+            self.temporary = Some(error.path);
+            return Err(error.error);
+        }
+        Ok(())
+    }
+
+    /// Clean only the owned temporary file. Successful publication consumed it already.
     pub fn discard(self) -> io::Result<()> {
-        if let Err(error) = self.temporary.close()
+        if let Some(temporary) = self.temporary
+            && let Err(error) = temporary.close()
             && error.kind() != io::ErrorKind::NotFound
         {
             return Err(io::Error::new(error.kind(), format!("cannot remove staging for {}: {error}", self.path.display())));
         }
-        if let Some(directory) = self.directory {
-            directory.close()?;
-        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn publish(mut self) -> io::Result<()> {
+        let _publication = PUBLICATION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prepare()?;
+        let result = self.publish_prepared();
+        self.discard()?;
+        result
     }
 }
 
@@ -180,13 +206,15 @@ fn resolve(requested: &Path, create_parents: bool) -> io::Result<PathBuf> {
             fs::create_dir_all(parent)?;
         }
         let name = path.file_name().ok_or_else(|| io::Error::other("output has no filename"))?;
-        path = parent.canonicalize()?.join(name);
+        path = canonical_parent(parent)?.0.join(name);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 let target = fs::read_link(&path)?;
                 path = if target.is_absolute() { target } else { path.parent().ok_or_else(|| io::Error::other("link has no parent"))?.join(target) };
             }
-            Ok(_) => return Ok(path),
+            // Include the leaf's actual on-disk spelling (not only its parent) in the
+            // reviewed destination. Existing Windows case aliases must compare equal.
+            Ok(_) => return path.canonicalize(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(path),
             Err(error) => return Err(error),
         }
@@ -194,12 +222,45 @@ fn resolve(requested: &Path, create_parents: bool) -> io::Result<PathBuf> {
     Err(io::Error::other("export destination has too many symbolic links"))
 }
 
+/// Canonicalize the existing ancestor, then normalize only its missing descendants.
+/// A preflight can review a new folder without creating it; existing symlinks still
+/// resolve through the OS before any lexical normalization of missing components.
+fn canonical_parent(parent: &Path) -> io::Result<(PathBuf, PathBuf)> {
+    let mut cursor = parent.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match cursor.canonicalize() {
+            Ok(anchor) => {
+                let mut resolved = anchor.clone();
+                for component in missing.iter().rev() {
+                    if component == std::ffi::OsStr::new("..") {
+                        resolved.pop();
+                    } else if component != std::ffi::OsStr::new(".") {
+                        resolved.push(component);
+                    }
+                }
+                return Ok((resolved, anchor));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if missing.len() >= 1024 {
+                    return Err(io::Error::other("export directory has too many missing components"));
+                }
+                let component = cursor.components().next_back().ok_or_else(|| io::Error::other("output has no existing ancestor"))?.as_os_str().to_os_string();
+                if !cursor.pop() {
+                    return Err(error);
+                }
+                missing.push(component);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
 
-    /// Prepare completed test bytes and close the writer before publication assertions.
     fn stage(path: &Path, bytes: &[u8]) -> Staged {
         let (staged, mut file) = Staged::create(path.to_str().unwrap()).unwrap();
         file.write_all(bytes).unwrap();
@@ -209,7 +270,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
     fn lifecycle_preserves_existing_bytes_until_publish_and_cleans_owned_files() {
         for existing in [false, true] {
             for action in ["drop", "discard", "publish"] {
@@ -218,15 +278,6 @@ mod tests {
                 if existing {
                     fs::write(&path, b"old complete movie").unwrap();
                 }
-                let expected = if existing {
-                    platform::Policy::read(&path).unwrap()
-                } else {
-                    let ordinary = dir.path().join("ordinary");
-                    fs::write(&ordinary, b"").unwrap();
-                    let policy = platform::Policy::read(&ordinary).unwrap();
-                    fs::remove_file(ordinary).unwrap();
-                    policy
-                };
                 let staged = stage(&path, b"new complete movie");
                 assert_eq!(fs::read(&path).ok(), existing.then(|| b"old complete movie".to_vec()));
                 match action {
@@ -234,308 +285,74 @@ mod tests {
                     "discard" => staged.discard().unwrap(),
                     _ => drop(staged),
                 }
-                if action == "publish" {
-                    assert_eq!(fs::read(&path).unwrap(), b"new complete movie");
-                    assert_eq!(platform::Policy::read(&path).unwrap(), expected);
-                } else {
-                    assert_eq!(fs::read(&path).ok(), existing.then(|| b"old complete movie".to_vec()));
-                }
-                assert_eq!(fs::read_dir(dir.path()).unwrap().count(), usize::from(existing || action == "publish"));
+                let expected = if action == "publish" { Some(b"new complete movie".to_vec()) } else { existing.then(|| b"old complete movie".to_vec()) };
+                assert_eq!(fs::read(&path).ok(), expected);
+                assert_eq!(fs::read_dir(dir.path()).unwrap().count(), usize::from(expected.is_some()));
             }
         }
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
-    fn competing_jobs_and_external_writes_are_not_overwritten_or_deleted() {
-        for existing in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("movie.mov");
-            if existing {
-                fs::write(&path, b"old").unwrap();
-            }
-            let first = stage(&path, b"first job");
-            let second = stage(&path, b"second job");
-            second.publish().unwrap();
-            assert!(first.publish().is_err());
-            assert_eq!(fs::read(&path).unwrap(), b"second job");
-            let third = stage(&path, b"third job");
-            fs::write(&path, b"external writer with different length").unwrap();
-            assert!(third.publish().is_err());
-            assert_eq!(fs::read(&path).unwrap(), b"external writer with different length");
-            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-
-            let race = dir.path().join("race.mov");
-            if existing {
-                fs::write(&race, b"old").unwrap();
-            }
-            let a = stage(&race, b"a");
-            let b = stage(&race, b"b");
-            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-            let barrier_b = barrier.clone();
-            let successes = std::thread::scope(|scope| {
-                let a = scope.spawn(move || {
-                    barrier.wait();
-                    a.publish().is_ok()
-                });
-                let b = scope.spawn(move || {
-                    barrier_b.wait();
-                    b.publish().is_ok()
-                });
-                usize::from(a.join().unwrap()) + usize::from(b.join().unwrap())
-            });
-            assert_eq!(successes, 1);
-            assert!(matches!(fs::read(race).unwrap().as_slice(), b"a" | b"b"));
-            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
-        }
-    }
-
-    #[test]
-    fn publication_failure_leaves_destination_and_no_staging() {
+    fn changed_destination_is_preserved_and_staging_is_cleaned() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("movie.mov");
-        let staged = stage(&path, b"complete movie");
-        fs::create_dir(&path).unwrap();
-        assert!(staged.publish().is_err());
-        assert!(path.is_dir());
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        for existing in [false, true] {
+            if existing {
+                fs::write(&path, b"original").unwrap();
+            }
+            let staged = stage(&path, b"replacement");
+            fs::write(&path, b"external writer").unwrap();
+            assert!(staged.publish().is_err());
+            assert_eq!(fs::read(&path).unwrap(), b"external writer");
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+            fs::remove_file(&path).unwrap();
+        }
     }
 
     #[test]
-    fn hardlink_aliases_are_rejected_without_touching_either_name() {
+    fn hardlink_replacement_changes_only_the_requested_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("movie.mov");
         let alias = dir.path().join("alias.mov");
         fs::write(&path, b"original").unwrap();
         fs::hard_link(&path, &alias).unwrap();
-        assert!(Staged::create(path.to_str().unwrap()).is_err());
-        assert_eq!(fs::read(path).unwrap(), b"original");
+        stage(&path, b"replacement").publish().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
         assert_eq!(fs::read(alias).unwrap(), b"original");
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn library_replacement_error_preserves_locked_destination_and_cleans_staging() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.mov");
+        fs::write(&path, b"original").unwrap();
+        let mut staged = stage(&path, b"replacement");
+        // Metadata-only access remains possible, but the library cannot replace this
+        // file while an ordinary reader denies delete sharing.
+        let lock = fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        staged.prepare().unwrap();
+        let error = staged.publish_prepared().unwrap_err();
+        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+        staged.discard().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        drop(lock);
+        stage(&path, b"replacement").publish().unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn relative_and_dangling_links_preserve_links_and_retargeting_fails() {
+    fn relative_and_dangling_symlinks_keep_the_link() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("movie.mov");
+        let target = dir.path().join("target.mov");
         let link = dir.path().join("link.mov");
-        let chain = dir.path().join("chain.mov");
-        symlink("movie.mov", &link).unwrap();
-        symlink("link.mov", &chain).unwrap();
-        stage(&chain, b"first").publish().unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"first");
-        stage(&chain, b"second").publish().unwrap();
+        symlink("target.mov", &link).unwrap();
+        stage(&link, b"first").publish().unwrap();
+        stage(&link, b"second").publish().unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"second");
-        assert_eq!(fs::read_link(&link).unwrap(), Path::new("movie.mov"));
-        let staged = stage(&chain, b"stale");
-        fs::remove_file(&link).unwrap();
-        symlink("elsewhere.mov", &link).unwrap();
-        assert!(staged.publish().is_err());
-        assert!(!dir.path().join("elsewhere.mov").exists());
-        fs::remove_file(&link).unwrap();
-        symlink("chain.mov", &link).unwrap();
-        assert!(Staged::create(chain.to_str().unwrap()).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"second");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_modes_group_and_policy_changes_are_preserved_or_rejected() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        for mode in [0o600, 0o640, 0o660] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("movie.mov");
-            fs::write(&path, b"old").unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
-            let before = fs::metadata(&path).unwrap();
-            let staged = stage(&path, b"replacement");
-            assert_eq!(fs::metadata(&staged.temporary).unwrap().permissions().mode() & 0o077, 0);
-            staged.publish().unwrap();
-            let after = fs::metadata(&path).unwrap();
-            assert_eq!((after.uid(), after.gid(), after.mode()), (before.uid(), before.gid(), before.mode()));
-            let staged = stage(&path, b"must not publish");
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-            assert!(staged.publish().is_err());
-            assert_eq!(fs::read(&path).unwrap(), b"replacement");
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    #[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
-    fn windows_inherited_and_protected_acls_and_policy_changes() {
-        use windows_permissions::{
-            constants::{SeObjectType as O, SecurityInformation as S},
-            wrappers as w,
-        };
-        for protected in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("movie.mov");
-            fs::write(&path, b"old").unwrap();
-            let owner = w::GetNamedSecurityInfo(path.as_os_str(), O::SE_FILE_OBJECT, S::Owner).unwrap();
-            let sid = w::ConvertSidToStringSid(w::GetSecurityDescriptorOwner(&owner).unwrap().unwrap()).unwrap();
-            let restricted = w::ConvertStringSecurityDescriptorToSecurityDescriptor(&format!("D:P(A;;FA;;;{})", sid.to_string_lossy())).unwrap();
-            if protected {
-                w::SetNamedSecurityInfo(
-                    path.as_os_str(),
-                    O::SE_FILE_OBJECT,
-                    S::Dacl | S::ProtectedDacl,
-                    None,
-                    None,
-                    w::GetSecurityDescriptorDacl(&restricted).unwrap(),
-                    None,
-                )
-                .unwrap();
-            }
-            let expected = platform::Policy::read(&path).unwrap();
-            let staged = stage(&path, b"replacement");
-            let private = w::GetNamedSecurityInfo(staged.temporary.as_os_str(), O::SE_FILE_OBJECT, S::Dacl).unwrap();
-            let private_text = w::ConvertSecurityDescriptorToStringSecurityDescriptor(&private, S::Dacl).unwrap();
-            // SDDL abbreviates well-known SIDs (for example S-1-5-32-544 becomes BA).
-            // Compare descriptors serialized by the same API rather than a numeric SID.
-            let restricted_text = w::ConvertSecurityDescriptorToStringSecurityDescriptor(&restricted, S::Dacl).unwrap();
-            assert_eq!(private_text.to_string_lossy().replace("D:PAI", "D:P"), restricted_text.to_string_lossy());
-            staged.publish().unwrap();
-            assert_eq!(platform::Policy::read(&path).unwrap(), expected);
-            let staged = stage(&path, b"must not publish");
-            let original_permissions = fs::metadata(&path).unwrap().permissions();
-            let mut permissions = original_permissions.clone();
-            permissions.set_readonly(true);
-            fs::set_permissions(&path, permissions).unwrap();
-            assert!(staged.publish().is_err());
-            assert_eq!(fs::read(&path).unwrap(), b"replacement");
-            fs::set_permissions(&path, original_permissions).unwrap();
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_named_acl_and_setgid_parent_do_not_broaden_replacement() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("movie.mov");
-        fs::write(&path, b"old").unwrap();
-        // Linux POSIX ACL xattr format: version followed by tag, permissions, numeric ID.
-        let mut acl = 2_u32.to_le_bytes().to_vec();
-        for (tag, perms, id) in [(1_u16, 6_u16, u32::MAX), (2, 4, 12345), (4, 0, u32::MAX), (16, 4, u32::MAX), (32, 0, u32::MAX)] {
-            acl.extend(tag.to_le_bytes());
-            acl.extend(perms.to_le_bytes());
-            acl.extend(id.to_le_bytes());
-        }
-        xattr::set(&path, "system.posix_acl_access", &acl).unwrap();
-        let expected = platform::Policy::read(&path).unwrap();
-        if fs::metadata(&path).unwrap().uid() == 0 {
-            // The local Linux probe runs as root, allowing a genuine different-group case.
-            std::os::unix::fs::chown(dir.path(), None, Some(54321)).unwrap();
-        }
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o2770)).unwrap();
-        let mut inherited_acl = acl.clone();
-        inherited_acl[16..20].copy_from_slice(&23456_u32.to_le_bytes());
-        xattr::set(dir.path(), "system.posix_acl_default", &inherited_acl).unwrap();
-        stage(&path, b"replacement").publish().unwrap();
-        assert_eq!(platform::Policy::read(&path).unwrap(), expected);
-        assert_eq!(xattr::get(&path, "system.posix_acl_access").unwrap().unwrap(), acl);
-        let staged = stage(&path, b"stale policy");
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o2700)).unwrap();
-        assert!(staged.publish().is_err());
-        assert_eq!(fs::read(path).unwrap(), b"replacement");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_inherited_acl_is_absent_from_private_staging_and_restored_on_publish() {
-        let dir = tempfile::tempdir().unwrap();
-        let acl =
-            [exacl::AclEntry::allow_group("everyone", exacl::Perm::READ | exacl::Perm::EXECUTE, exacl::Flag::FILE_INHERIT | exacl::Flag::DIRECTORY_INHERIT)];
-        exacl::setfacl(&[dir.path()], &acl, None).unwrap();
-        let path = dir.path().join("movie.mov");
-        fs::write(&path, b"old").unwrap();
-        let expected = platform::Policy::read(&path).unwrap();
-        let staged = stage(&path, b"replacement");
-        assert!(exacl::getfacl(&staged.temporary, None).unwrap().is_empty());
-        staged.publish().unwrap();
-        assert_eq!(platform::Policy::read(&path).unwrap(), expected);
-        assert_eq!(fs::read(path).unwrap(), b"replacement");
-    }
-    /// More frames than a typical descriptor limit: snapshots retain metadata, not open files.
-    #[test]
-    #[cfg_attr(windows, ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner")]
-    fn replacement_sequence_keeps_file_handle_use_constant() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut pending = Vec::new();
-        for frame in 0..1536 {
-            let path = dir.path().join(format!("frame_{frame}.png"));
-            fs::write(&path, b"old").unwrap();
-            pending.push(stage(&path, b"new"));
-        }
-        for staged in pending {
-            let path = staged.path.clone();
-            assert_eq!(fs::read(&path).unwrap(), b"old");
-            staged.publish().unwrap();
-            assert_eq!(fs::read(&path).unwrap(), b"new");
-        }
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1536);
-    }
-
-    /// Refusal must leave existing bytes and policy intact without disabling new exports.
-    #[cfg(windows)]
-    #[test]
-    fn windows_audit_refusal_preserves_existing_and_allows_new() {
-        const CHILD: &str = "EFFECTCRAFT_AUDIT_REFUSAL_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let name = format!("{}::windows_audit_refusal_preserves_existing_and_allows_new", module_path!().split_once("::").unwrap().1);
-            let status = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", &name, "--nocapture"]).env(CHILD, "1").status().unwrap();
-            assert!(status.success());
-            return;
-        }
-        // Privilege removal affects only this isolated child, never parallel tests.
-        let token = winsafe::HPROCESS::GetCurrentProcess().OpenProcessToken(winsafe::co::TOKEN::ADJUST_PRIVILEGES | winsafe::co::TOKEN::QUERY).unwrap();
-        let luid = winsafe::LookupPrivilegeValue(None, winsafe::co::SE_PRIV::SECURITY_NAME).unwrap();
-        let privileges = winsafe::TOKEN_PRIVILEGES::new(&[winsafe::LUID_AND_ATTRIBUTES::new(luid, winsafe::co::SE_PRIV_ATTR::REMOVED)]).unwrap();
-        token.AdjustTokenPrivileges(winsafe::DisabPriv::Privs(&privileges)).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let existing = dir.path().join("old.mov");
-        fs::write(&existing, b"old complete movie").unwrap();
-        let error = match Staged::create(existing.to_str().unwrap()) {
-            Ok(_) => panic!("replacement unexpectedly succeeded without audit privilege"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("Windows audit policy"), "{error}");
-        assert_eq!(fs::read(&existing).unwrap(), b"old complete movie");
-        let new = dir.path().join("new.mov");
-        stage(&new, b"new complete movie").publish().unwrap();
-        assert_eq!(fs::read(new).unwrap(), b"new complete movie");
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
-    }
-
-    /// Audit ACEs and SACL protection survive replacement; changes during rendering refuse it.
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "requires enabled SeSecurityPrivilege; exercised by the Windows audit CI runner"]
-    fn windows_audit_entries_and_protection_are_preserved() {
-        use windows_permissions::{
-            constants::{SeObjectType as O, SecurityInformation as S},
-            wrappers as w,
-        };
-        for protected in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("audited.mov");
-            fs::write(&path, b"old complete movie").unwrap();
-            let descriptor = w::ConvertStringSecurityDescriptorToSecurityDescriptor("S:P(AU;SAFA;FW;;;WD)").unwrap();
-            let flags = S::Sacl | if protected { S::ProtectedSacl } else { S::UnprotectedSacl };
-            w::SetNamedSecurityInfo(path.as_os_str(), O::SE_FILE_OBJECT, flags, None, None, None, w::GetSecurityDescriptorSacl(&descriptor).unwrap()).unwrap();
-            let expected = platform::Policy::read_existing(&path).unwrap();
-            stage(&path, b"complete replacement").publish().unwrap();
-            assert!(expected.matches(&path).unwrap());
-            let staged = stage(&path, b"must not publish");
-            let changed = w::ConvertStringSecurityDescriptorToSecurityDescriptor("S:P(AU;SAFA;FR;;;WD)").unwrap();
-            w::SetNamedSecurityInfo(path.as_os_str(), O::SE_FILE_OBJECT, flags, None, None, None, w::GetSecurityDescriptorSacl(&changed).unwrap()).unwrap();
-            let changed = platform::Policy::read_existing(&path).unwrap();
-            assert!(staged.publish().is_err());
-            assert_eq!(fs::read(&path).unwrap(), b"complete replacement");
-            assert!(changed.matches(&path).unwrap());
-        }
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("target.mov"));
     }
 }
