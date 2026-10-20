@@ -6,10 +6,12 @@ ReplaceFile and TxF outcomes are reported independently; no universal TxF claim.
 """
 
 import argparse
+import atexit
 import ctypes as c
 from ctypes import wintypes as w
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -52,6 +54,59 @@ exit_code = api(k, "GetExitCodeProcess", [w.HANDLE, c.POINTER(w.DWORD)], w.BOOL)
 member = api(a, "CheckTokenMembership", [w.HANDLE, c.c_void_p, c.POINTER(w.BOOL)], w.BOOL)
 token_info = api(a, "GetTokenInformation", [w.HANDLE, w.DWORD, c.c_void_p, w.DWORD, c.POINTER(w.DWORD)], w.BOOL)
 get_control = api(a, "GetSecurityDescriptorControl", [c.c_void_p, c.POINTER(w.WORD), c.POINTER(w.DWORD)], w.BOOL)
+initialize_acl = api(a, "InitializeAcl", [c.c_void_p, w.DWORD, w.DWORD], w.BOOL)
+sid_to_text = api(a, "ConvertSidToStringSidW", [c.c_void_p, c.POINTER(c.c_void_p)], w.BOOL)
+u = c.WinDLL("user32", use_last_error=True)
+get_station = api(u, "GetProcessWindowStation", [], w.HANDLE)
+set_station = api(u, "SetProcessWindowStation", [w.HANDLE], w.BOOL)
+new_station = api(u, "CreateWindowStationW", [w.LPCWSTR, w.DWORD, w.DWORD, c.c_void_p], w.HANDLE)
+new_desktop = api(u, "CreateDesktopW", [w.LPCWSTR, w.LPCWSTR, c.c_void_p, w.DWORD, w.DWORD, c.c_void_p], w.HANDLE)
+close_station = api(u, "CloseWindowStation", [w.HANDLE], w.BOOL)
+close_desktop = api(u, "CloseDesktop", [w.HANDLE], w.BOOL)
+_private_desktop = None
+
+
+class SECURITY_ATTRIBUTES(c.Structure):
+    _fields_ = [("length", w.DWORD), ("descriptor", c.c_void_p), ("inherit", w.BOOL)]
+
+
+def writer_desktop():
+    """Avoid inheriting a service desktop whose DACL denies the restricted token.
+
+    Create an owned, noninteractive station/desktop, granting only this user SID
+    and SYSTEM. Never switch the visible desktop or modify its access policy.
+    """
+    global _private_desktop
+    if _private_desktop:
+        return _private_desktop[0]
+    token, text, descriptor = w.HANDLE(), c.c_void_p(), c.c_void_p()
+    check(win.open_token(win.current(), 8, c.byref(token)))
+    try:
+        user = token_buffer(token, 1)
+        sid = c.c_void_p.from_buffer(user).value
+        check(sid_to_text(sid, c.byref(text)))
+        sddl = f"D:(A;;GA;;;SY)(A;;GA;;;{c.wstring_at(text)})S:(ML;;NW;;;ME)"
+        check(win.convert_in(sddl, 1, c.byref(descriptor), None))
+        attributes = SECURITY_ATTRIBUTES(c.sizeof(SECURITY_ATTRIBUTES), descriptor, False)
+        name = f"EffectCraftAudit-{os.getpid()}"
+        original = get_station()
+        station = new_station(name, 1, 0xF037F, c.byref(attributes))
+        check(station)
+        desktop = None
+        try:
+            check(set_station(station))
+            desktop = new_desktop("Writer", None, None, 0, 0x10000000, c.byref(attributes))
+            check(desktop)
+        finally:
+            check(set_station(original))
+            if not desktop: close_station(station)
+        _private_desktop = (name + "\\Writer", station, desktop)
+        atexit.register(lambda: (close_desktop(desktop), close_station(station)))
+        return _private_desktop[0]
+    finally:
+        win.close(token)
+        if text: win.free(text)
+        if descriptor: win.free(descriptor)
 
 
 def token_buffer(token, kind):
@@ -64,12 +119,13 @@ def token_buffer(token, kind):
 
 def launch_restricted(path, action, result):
     original, token = w.HANDLE(), w.HANDLE()
-    admin, medium = c.c_void_p(), c.c_void_p()
+    admin, admin_account, medium = c.c_void_p(), c.c_void_p(), c.c_void_p()
     check(win.open_token(win.current(), 0xF01FF, c.byref(original)))
     try:
         check(sid_from_text("S-1-5-32-544", c.byref(admin)))
-        disabled = SID_ATTR(admin, 0)
-        check(restricted(original, 1, 1, c.byref(disabled), 0, None, 0, None, c.byref(token)))
+        check(sid_from_text("S-1-5-114", c.byref(admin_account)))
+        disabled = (SID_ATTR * 2)(SID_ATTR(admin, 0), SID_ATTR(admin_account, 0))
+        check(restricted(original, 1, 2, disabled, 0, None, 0, None, c.byref(token)))
         check(sid_from_text("S-1-16-8192", c.byref(medium)))
         label = SID_ATTR(medium, 0x20)
         check(set_token(token, 25, c.byref(label), c.sizeof(label) + sid_size(medium)))
@@ -77,6 +133,7 @@ def launch_restricted(path, action, result):
             sys.executable, str(Path(__file__).resolve()), "--writer", str(path), action, str(result)]))
         startup, process = STARTUP(), PROCESS()
         startup.cb = c.sizeof(startup)
+        startup.desktop = writer_desktop()
         check(create_process(token, sys.executable, command, None, None, False,
                              0x08000000, None, str(path.parent), c.byref(startup), c.byref(process)))
         check(win.close(process.thread))
@@ -85,6 +142,7 @@ def launch_restricted(path, action, result):
         if token: win.close(token)
         win.close(original)
         if admin: win.free(admin)
+        if admin_account: win.free(admin_account)
         if medium: win.free(medium)
 
 
@@ -192,7 +250,12 @@ def run_case(root, policy, action):
     if policy.startswith("explicit"):
         win.seed(path, policy.endswith("protected" ) and not policy.endswith("unprotected"))
     elif policy == "empty":
-        set_audit(path, "S:", True)
+        # SDDL 'S:' parsed successfully but produced a null ACL on the runner.
+        # An actual zero-ACE ACL requires an initialized 8-byte ACL header.
+        acl = c.create_string_buffer(8)
+        check(initialize_acl(acl, 8, 2))
+        code = win.set_security(str(path), 1, 8 | 0x40000000, None, None, None, acl)
+        if code: raise c.WinError(code)
     elif policy == "null":
         set_audit(path, "S:NO_ACCESS_CONTROL", True)
     # 'default' captures the actual freshly-created absent/null state, without
