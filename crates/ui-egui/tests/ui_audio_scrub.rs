@@ -215,6 +215,9 @@ fn scrub_reports_excessive_audio_work() {
     for script in [false, true] {
         let fake = Fake::default();
         let (mut app, cid) = setup(true, &fake);
+        // A failed new scrub must also discard the previous successful snippet.
+        app.scrub_audio(cid, Tick::ZERO, 0.0);
+        assert!(fake.0.lock().unwrap().0.as_ref().unwrap().queued_frames() > 0);
         if script {
             app.session.expr = effectcraft_host::session().expr;
             let p = Arc::make_mut(&mut app.session.project);
@@ -227,6 +230,11 @@ fn scrub_reports_excessive_audio_work() {
         } else {
             Arc::make_mut(&mut app.session.project).comp_mut(cid).unwrap().layers[0].stretch = 0.000001;
         }
+        // Check the same feed before harness startup can close an idle scrub device.
+        app.scrub_audio(cid, Tick::from_units(1, 30), 0.1);
+        let feed = fake.0.lock().unwrap().0.clone().unwrap();
+        assert_eq!(feed.queued_frames(), 0);
+        assert!(feed.error().is_some());
         let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_| app);
         h.run_steps(3);
         let start = std::time::Instant::now();

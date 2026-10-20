@@ -412,6 +412,7 @@ impl AudioScrub {
         let mut buf = match mix_block(src, comp, c.frame_rate.tick_of(frame), n, rate, mix, None) {
             Ok(buf) => buf,
             Err(e) => {
+                self.feed.clear();
                 self.feed.fail(e.to_string());
                 return false;
             }
