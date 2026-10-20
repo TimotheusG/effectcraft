@@ -24,6 +24,10 @@ by the platform adapter; errors preserve the old output instead of weakening acc
   access before reopening for encoding. Staging stays beside the destination so
   publication can restore inherited as well as protected DACLs. The adapter checks
   owner, group, DACL, integrity/resource access metadata and readonly state.
+  Windows may modernize a legacy unprotected file ACL by appending inherited
+  duplicates of existing unconditional allow grants. Only that equivalent form
+  is accepted; new rights, deny changes, protection changes, and SACL changes
+  still fail policy verification.
 - Linux preserves numeric ownership, permission bits, and security/system xattrs,
   including POSIX access ACLs. A setgid directory cannot silently change the owner
   group of an existing output. No libacl dependency is added on Linux.
@@ -49,7 +53,8 @@ The destination identity, length, modification time, access policy, resolved tar
 and parent access policy are checked again before publication. Changed destinations
 cause an error. Jobs in one process serialize their final validation/replacement.
 New destinations are published with a no-clobber hard link, so an intervening creator
-cannot be overwritten. This requires a filesystem that supports hard links.
+cannot be overwritten. This requires a filesystem that supports hard links; an empty probe checks that
+capability before encoding begins.
 
 External writers must cooperate. Portable rename does not provide compare-and-swap
 against a file version, so there remains a race between the final check and replacing

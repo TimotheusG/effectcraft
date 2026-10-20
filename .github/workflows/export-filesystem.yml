@@ -30,6 +30,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Native filesystem contract
-        run: cargo test --locked --release -p effectcraft-export --lib pending::native::tests
+        run: cargo test --locked --release -p effectcraft-export --lib pending::native
       - name: Export integration
         run: cargo test --locked --release -p effectcraft-export --test render_settings

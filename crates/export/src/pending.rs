@@ -12,6 +12,7 @@ pub(crate) struct Pending {
 }
 
 impl Pending {
+    /// Open a sink directly or register a unique, private native staging file for this job.
     pub fn create<'a>(&self, sink: Option<&'a out::Sink>, path: &str) -> Result<out::Out<'a>> {
         if sink.is_some() {
             return out::create(sink, path);
@@ -47,6 +48,7 @@ impl Pending {
         Ok(())
     }
 
+    /// Attempt cleanup of every pending file, returning the first cleanup failure.
     pub fn discard(&self) -> Result<()> {
         #[cfg(not(target_arch = "wasm32"))]
         {

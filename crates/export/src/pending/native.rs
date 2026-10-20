@@ -36,6 +36,7 @@ struct Version {
 }
 
 impl Version {
+    /// Capture the writable destination's identity, content timestamp, and access policy.
     fn read(file: &File, path: &Path) -> io::Result<Self> {
         let metadata = file.metadata()?;
         if !metadata.is_file() || platform::links(file)? != 1 {
@@ -52,6 +53,7 @@ impl Version {
 }
 
 impl Staged {
+    /// Check destination capabilities before creating private, job-owned media storage.
     pub fn create(path: &str) -> io::Result<(Self, File)> {
         let requested = std::path::absolute(path)?;
         let path = resolve(&requested, true)?;
@@ -73,6 +75,14 @@ impl Staged {
         // The ordinary creation probe is always empty. No exported bytes ever enter an inode
         // that another account might have opened before access was restricted.
         let probe = platform::ordinary_file(parent)?;
+        if original.is_none() {
+            // Reject unsupported no-clobber publication before rendering. The probe contains
+            // no media; the owned directory also cleans its link on an early return.
+            let links = tempfile::Builder::new().prefix(".effectcraft-policy-").tempdir_in(parent)?;
+            fs::hard_link(probe.path(), links.path().join("link"))
+                .map_err(|error| io::Error::new(error.kind(), format!("export filesystem cannot publish new files with hard links: {error}")))?;
+            links.close()?;
+        }
         let policy = match &original {
             Some(version) => version.policy.clone(),
             None => platform::Policy::read(probe.path())?,
@@ -92,6 +102,7 @@ impl Staged {
         Ok((staged, file))
     }
 
+    /// Reject changed links, destination versions, or parent access policy.
     pub fn validate(&self) -> io::Result<()> {
         if resolve(&self.requested, false)? != self.path {
             return Err(io::Error::other("export destination symlink changed while rendering"));
@@ -116,6 +127,7 @@ impl Staged {
         Ok(())
     }
 
+    /// Serialize final validation/publication and clean staging even when publication fails.
     pub fn publish(self) -> io::Result<()> {
         let result = {
             let _publication = PUBLICATION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -129,6 +141,7 @@ impl Staged {
         }
     }
 
+    /// Restore access policy and publish one complete file without clobbering a new creator.
     fn publish_inner(&self) -> io::Result<()> {
         self.validate()?;
         self.policy.apply(&self.temporary)?;
@@ -146,6 +159,7 @@ impl Staged {
         Ok(())
     }
 
+    /// Remove only owned staging paths; a successful rename already consumed the file path.
     pub fn discard(self) -> io::Result<()> {
         if let Err(error) = self.temporary.close()
             && error.kind() != io::ErrorKind::NotFound
@@ -188,6 +202,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Prepare completed test bytes and close the writer before publication assertions.
     fn stage(path: &Path, bytes: &[u8]) -> Staged {
         let (staged, mut file) = Staged::create(path.to_str().unwrap()).unwrap();
         file.write_all(bytes).unwrap();
