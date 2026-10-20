@@ -848,3 +848,48 @@ fn render_log_symlink_does_not_follow_or_truncate_an_unrelated_target() {
     assert_eq!(std::fs::read_link(&wanted).unwrap(), unrelated);
     assert_eq!(std::fs::read(&wanted).unwrap(), b"unrelated project bytes");
 }
+
+/// Review more than the former path limit without encoding 100001 frames or creating them.
+#[test]
+fn long_fresh_sequences_and_overflow_keep_exact_bounded_authorization() {
+    struct Room;
+    impl StorageQuota for Room {
+        fn has_room(&self, _: &str, _: u64) -> bool {
+            true
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f_[#####].png");
+    let overflow = dir.path().join("overflow");
+    let (p, cid) = project(FrameRate::new(25, 1), |_, comp| {
+        comp.duration = Tick::from_seconds_f64(100_001.0 / 25.0);
+    });
+    let output = OutputModule::for_format(OutputFormat::PngSequence);
+    for alternatives in [false, true] {
+        // 50001 frames with one overflow folder yield100002 candidates.
+        let time_span =
+            if alternatives { TimeSpan::Custom { start: Tick::ZERO, end: Tick::from_seconds_f64(50_001.0 / 25.0) } } else { TimeSpan::LengthOfComp };
+        let settings = RenderSettings { time_span, storage_overflow: alternatives, ..Default::default() };
+        let mut job = disk_job(&p, cid, &settings, &output, path.to_str().unwrap());
+        job.options.storage = alternatives.then_some(&Room);
+        job.options.overflow = if alternatives { vec![overflow.to_str().unwrap().into()] } else { vec![] };
+        let reviewed = effectcraft_export::preflight(&job).unwrap();
+        let expected = if alternatives { 100_002 } else { 100_001 };
+        assert!(reviewed.collisions.is_empty());
+        assert_eq!(reviewed.destinations.len(), expected);
+        assert_eq!(reviewed.authorization["targets"].as_object().unwrap().len(), expected);
+        assert!(serde_json::to_vec(&reviewed.authorization).unwrap().len() <= 64 * 1024 * 1024);
+        let last = sequence_path(job.path, if alternatives { 50_000 } else { 100_000 });
+        let key = std::path::absolute(&last).unwrap();
+        let entry = &reviewed.authorization["targets"][key.to_str().unwrap()];
+        assert!(entry["state"].is_null());
+        assert!(entry["resolved"].is_string());
+        assert!(entry["anchor"].is_string());
+        assert!(entry.get("anchorPolicy").is_some());
+        // This validates every reviewed path and a token larger than the former count
+        // limit, then cancels before opening staging or encoding the long sequence.
+        let error = effectcraft_export::export_authorized(&job, &reviewed.authorization, &mut |_| false).unwrap_err();
+        assert!(matches!(error, effectcraft_export::ExportError::Cancelled), "{error}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}

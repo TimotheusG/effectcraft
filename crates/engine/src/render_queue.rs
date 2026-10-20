@@ -588,9 +588,6 @@ impl Session {
                     if destinations.contains(&destination) {
                         return Err(format!("queued outputs use the same output destination: {destination}; choose separate output paths"));
                     }
-                    if destinations.len() >= 100_000 {
-                        return Err("render review exceeds 100000 output destinations; render fewer queue items at once".into());
-                    }
                     destinations.insert(destination);
                 }
                 let bytes = serde_json::to_vec(&review.authorization).map_err(|e| e.to_string())?.len();

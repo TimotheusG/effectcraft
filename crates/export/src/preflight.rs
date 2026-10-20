@@ -5,7 +5,8 @@ use serde_json::{Map, Value, json};
 use crate::{Job, Result, io};
 
 const FORMAT: &str = "effectcraft.output-approval.v1";
-const MAX_TARGETS: usize = 100_000;
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_COLLISIONS: usize = 100_000;
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_TOKEN_BYTES: usize = 64 * 1024 * 1024;
 
@@ -30,7 +31,7 @@ pub fn preflight(job: &Job<'_>) -> Result<OutputPreflight> {
 fn collect(job: &Job<'_>) -> Result<(Map<String, Value>, Vec<String>, Vec<String>)> {
     let mut targets = Map::new();
     let mut collisions = Vec::new();
-    let mut bytes = 0_usize;
+    let mut bytes = serde_json::to_vec(&json!({"format": FORMAT, "targets": {}})).map_err(io)?.len();
     let mut destinations = std::collections::BTreeSet::new();
     if job.sink.is_none() {
         visit_paths(job, |path, skipped| {
@@ -43,14 +44,15 @@ fn collect(job: &Job<'_>) -> Result<(Map<String, Value>, Vec<String>, Vec<String
             if targets.contains_key(&key) {
                 return Ok(());
             }
-            if targets.len() >= MAX_TARGETS {
-                return Err(io("export preflight exceeds 100000 distinct output paths"));
+            if existing && collisions.len() >= MAX_COLLISIONS {
+                return Err(io("export preflight exceeds 100000 existing outputs"));
             }
             let size = serde_json::to_vec(&entry)
                 .map_err(io)?
                 .len()
-                .checked_add(key.len().saturating_mul(6))
-                .and_then(|size| size.checked_add(8))
+                .checked_add(serde_json::to_vec(&key).map_err(io)?.len())
+                // The colon and comma; the initial envelope already includes braces.
+                .and_then(|size| size.checked_add(2))
                 .ok_or_else(|| io("export preflight metadata size overflow"))?;
             bytes = bytes.checked_add(size).filter(|n| *n <= MAX_TOKEN_BYTES).ok_or_else(|| io("export preflight metadata exceeds 64 MiB"))?;
             if existing {
@@ -95,21 +97,13 @@ pub(crate) fn token_targets(authorization: &Value) -> std::io::Result<&Map<Strin
     if authorization.get("format").and_then(Value::as_str) != Some(FORMAT) {
         return Err(std::io::Error::other("invalid export authorization; run preflight again"));
     }
-    authorization
-        .get("targets")
-        .and_then(Value::as_object)
-        .filter(|targets| targets.len() <= MAX_TARGETS)
-        .ok_or_else(|| std::io::Error::other("invalid or oversized export authorization"))
+    authorization.get("targets").and_then(Value::as_object).ok_or_else(|| std::io::Error::other("invalid export authorization targets"))
 }
 
 fn visit_paths(job: &Job<'_>, mut visit: impl FnMut(&str, bool) -> Result<()>) -> Result<()> {
     let comp = job.project.comp(job.comp).ok_or(crate::ExportError::NoComp)?;
     let frames = if job.output.format.is_sequence() { job.settings.frame_count(comp) } else { 1 };
     let alternatives = if job.settings.storage_overflow && job.options.storage.is_some() { job.options.overflow.len() } else { 0 };
-    let count = frames.checked_mul(alternatives.saturating_add(1) as u64).ok_or_else(|| io("export preflight path count overflow"))?;
-    if count > MAX_TARGETS as u64 {
-        return Err(io("export preflight exceeds 100000 output candidates"));
-    }
     let first = job.settings.first_frame(comp);
     for frame in 0..frames {
         let path = if job.output.format.is_sequence() {

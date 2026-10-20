@@ -325,3 +325,29 @@ fn overwrite_preflight_bounds_repeated_path_bytes_before_segment_expansion() {
     assert!(s.render_review.is_none());
     assert!(ex.log.lock().unwrap().is_empty());
 }
+
+#[test]
+fn fresh_preflight_accepts_more_than_100000_destinations() {
+    use crate::render_queue::ExportPreflight;
+    struct LongSequence;
+    impl Exporter for LongSequence {
+        fn formats(&self) -> Vec<OutputFormat> {
+            vec![OutputFormat::PngSequence]
+        }
+        fn preflight(&self, _: &ExportJob) -> Result<ExportPreflight, String> {
+            Ok(ExportPreflight {
+                collisions: vec![],
+                destinations: (0..100_001).map(|frame| format!("/fresh/f_{frame}.png")).collect(),
+                authorization: json!({"bounded": true}),
+            })
+        }
+        fn export(&self, _: &ExportJob, _: &mut dyn FnMut(u64, u64) -> bool) -> Result<ExportResult, String> {
+            Err("preflight must not render".into())
+        }
+    }
+    let mut session = Session { exporter: Some(Arc::new(LongSequence)), ..Default::default() };
+    session.execute("comp.new", json!({"width":4, "height":4, "duration":1})).unwrap();
+    session.execute("renderQueue.add", json!({"format":"png", "output": crate::tests_stubs::tmp_out("long_[#####].png")})).unwrap();
+    let review = session.preflight_render().unwrap();
+    assert!(review["collisions"].as_array().unwrap().is_empty());
+}

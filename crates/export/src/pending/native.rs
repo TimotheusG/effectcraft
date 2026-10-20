@@ -140,7 +140,22 @@ impl Staged {
         let path = resolve(&requested, true)?;
         let original = readable_state(&path)?;
         let parent = path.parent().ok_or_else(|| io::Error::other("output has no parent directory"))?;
-        let (file, temporary) = tempfile::Builder::new().prefix(".effectcraft-export-").tempfile_in(parent)?.into_parts();
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".effectcraft-export-");
+        #[cfg(unix)]
+        let existing_permissions = {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = if original.is_null() { None } else { Some(fs::metadata(&path)?.permissions()) };
+            builder.permissions(permissions.clone().unwrap_or_else(|| fs::Permissions::from_mode(0o666)));
+            permissions
+        };
+        let (file, temporary) = builder.tempfile_in(parent)?.into_parts();
+        #[cfg(unix)]
+        if let Some(permissions) = existing_permissions {
+            // Creation applies umask even to an existing mode. Retain that mode on the
+            // owned staging file, including bits the current umask would remove.
+            file.set_permissions(permissions)?;
+        }
         let staged = Self { temporary: Some(temporary), path, requested, original };
         staged.validate()?;
         Ok((staged, file))
@@ -319,6 +334,23 @@ mod tests {
         stage(&path, b"replacement").publish().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"replacement");
         assert_eq!(fs::read(alias).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_publication_uses_normal_creation_mode_and_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ordinary = dir.path().join("ordinary");
+        drop(File::create(&ordinary).unwrap());
+        let creation_mode = fs::metadata(&ordinary).unwrap().permissions().mode() & 0o777;
+        let path = dir.path().join("movie.mov");
+        stage(&path, b"new output").publish().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, creation_mode);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        stage(&path, b"replacement").publish().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o664);
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
     }
 
     #[cfg(windows)]
