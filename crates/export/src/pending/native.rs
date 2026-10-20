@@ -78,7 +78,10 @@ impl Staged {
             None => platform::Policy::read(probe.path())?,
         };
         policy.apply(probe.path())?;
-        if platform::Policy::read(probe.path())? != policy {
+        let restored = platform::Policy::read(probe.path())?;
+        if restored != policy {
+            #[cfg(test)]
+            eprintln!("policy restoration mismatch: expected {policy:?}; restored {restored:?}");
             return Err(io::Error::other("cannot preserve export destination access policy on this filesystem"));
         }
         probe.close()?;

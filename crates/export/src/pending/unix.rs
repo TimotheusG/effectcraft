@@ -47,20 +47,22 @@ impl Policy {
         if self.mode & 0o7000 != 0 || self.attributes.iter().any(|(name, _)| name == "security.capability") {
             return Err(io::Error::other("cannot replace an export destination carrying executable privileges"));
         }
-        let current = fs::metadata(path)?;
+        // Read access attributes before removing read permission: macOS requires it even
+        // when the caller owns the inode. Reuse this snapshot while restoring attributes.
+        let current = Self::read(path)?;
         // Do not grant the destination owner the staging inode's initial owner-read bit
         // while transferring ownership. ACL grants/denials are installed before final mode.
         fs::set_permissions(path, fs::Permissions::from_mode(0))?;
-        if (current.uid(), current.gid()) != (self.uid, self.gid) {
+        if (current.uid, current.gid) != (self.uid, self.gid) {
             std::os::unix::fs::chown(path, Some(self.uid), Some(self.gid))?;
         }
-        for (name, _) in Self::read(path)?.attributes {
-            if !self.attributes.iter().any(|(wanted, _)| wanted == &name) {
+        for (name, _) in &current.attributes {
+            if !self.attributes.iter().any(|(wanted, _)| wanted == name) {
                 xattr::remove(path, name)?;
             }
         }
         for (name, value) in &self.attributes {
-            if xattr::get(path, name)?.as_deref() != Some(value.as_slice()) {
+            if !current.attributes.iter().any(|(old_name, old_value)| old_name == name && old_value == value) {
                 xattr::set(path, name, value)?;
             }
         }
