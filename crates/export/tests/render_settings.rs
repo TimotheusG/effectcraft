@@ -476,3 +476,128 @@ fn a_job_renders_on_one_compositor() {
     assert_eq!(cpu.frames.load(Ordering::SeqCst), 0);
     assert_eq!(c[0].get_pixel(10, 44).0, [255, 0, 0, 255], "the CPU drew the red block");
 }
+
+/// Cancellation after an encoder has opened its output must preserve the prior export.
+#[test]
+fn cancelled_replacement_preserves_existing_movie_and_sequence() {
+    let dir = std::env::temp_dir().join(format!("ec-preserve-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    for format in [OutputFormat::H264, OutputFormat::PngSequence] {
+        let om = OutputModule::for_format(format);
+        let path = dir.join(if format.is_sequence() { "existing_[#####].png" } else { "existing.mp4" });
+        let final_path = if format.is_sequence() { dir.join("existing_00000.png") } else { path.clone() };
+        std::fs::write(&final_path, b"previous complete export").unwrap();
+        let result = export(
+            &Job {
+                project: &p,
+                footage: &NoFootage,
+                expr: None,
+                accel: None,
+                comp: cid,
+                settings: &RenderSettings::default(),
+                output: &om,
+                path: path.to_str().unwrap(),
+                sink: None,
+                nested_switches: true,
+                options: JobOptions::default(),
+            },
+            &mut |progress| progress.done == 0,
+        );
+        assert!(matches!(result, Err(effectcraft_export::ExportError::Cancelled)));
+        assert_eq!(std::fs::read(&final_path).ok().as_deref(), Some(b"previous complete export".as_slice()));
+        std::fs::remove_file(final_path).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+    std::fs::remove_dir(dir).unwrap();
+}
+
+/// A complete two-second export matches the sink output byte-for-byte, both for a new
+/// destination and a replacement. This exercises the real muxer and parallel sequence path.
+#[test]
+fn published_movie_and_sequence_match_complete_sink_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let settings = RenderSettings::default();
+    for format in [OutputFormat::Uncompressed, OutputFormat::PngSequence] {
+        let om = OutputModule::for_format(format);
+        let path = dir.path().join(if format.is_sequence() { "movie_[#####].png" } else { "movie.mov" });
+        let path = path.to_str().unwrap();
+        let expected = run(&p, cid, &settings, &om, path);
+        for replace in [false, true] {
+            if replace {
+                for (name, _) in expected.lock().unwrap().iter() {
+                    std::fs::write(name, b"previous export").unwrap();
+                }
+            }
+            let result = export(
+                &Job {
+                    project: &p,
+                    footage: &NoFootage,
+                    expr: None,
+                    accel: None,
+                    comp: cid,
+                    settings: &settings,
+                    output: &om,
+                    path,
+                    sink: None,
+                    nested_switches: true,
+                    options: JobOptions::default(),
+                },
+                &mut |_| true,
+            )
+            .unwrap();
+            assert_eq!(result.frames, 50);
+            for (name, bytes) in expected.lock().unwrap().iter() {
+                assert_eq!(&std::fs::read(name).unwrap(), bytes, "{name}");
+            }
+        }
+        for (name, _) in expected.lock().unwrap().iter() {
+            std::fs::remove_file(name).unwrap();
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
+/// An I/O failure after a sequence starts must also preserve all earlier complete outputs.
+#[test]
+fn sequence_write_failure_preserves_existing_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocked = dir.path().join("blocked-overflow");
+    std::fs::write(&blocked, b"ordinary file, not a directory").unwrap();
+    let path = dir.path().join("movie_[#####].png");
+    let path = path.to_str().unwrap();
+    for frame in 0..50 {
+        std::fs::write(sequence_path(path, frame), b"old complete frame").unwrap();
+    }
+    struct FailAfterFirst(AtomicUsize);
+    impl StorageQuota for FailAfterFirst {
+        fn has_room(&self, path: &str, _: u64) -> bool {
+            path.contains("blocked-overflow") || self.0.fetch_add(1, Ordering::SeqCst) == 0
+        }
+    }
+    let storage = FailAfterFirst(AtomicUsize::new(0));
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let result = export(
+        &Job {
+            project: &p,
+            footage: &NoFootage,
+            expr: None,
+            accel: None,
+            comp: cid,
+            settings: &RenderSettings { storage_overflow: true, ..Default::default() },
+            output: &OutputModule::for_format(OutputFormat::PngSequence),
+            path,
+            sink: None,
+            nested_switches: true,
+            options: JobOptions { storage: Some(&storage), overflow: vec![blocked.to_string_lossy().into_owned()], ..Default::default() },
+        },
+        &mut |_| true,
+    );
+    assert!(matches!(result, Err(effectcraft_export::ExportError::Io(_))), "{result:?}");
+    for frame in 0..50 {
+        assert_eq!(std::fs::read(sequence_path(path, frame)).unwrap(), b"old complete frame");
+    }
+    assert_eq!(std::fs::read(blocked).unwrap(), b"ordinary file, not a directory");
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".effectcraft-")));
+}

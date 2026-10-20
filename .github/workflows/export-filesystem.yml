@@ -1,0 +1,35 @@
+name: Export filesystem
+
+on:
+  push:
+    paths: ["crates/export/**", "Cargo.lock", ".github/workflows/export-filesystem.yml"]
+  pull_request:
+    paths: ["crates/export/**", "Cargo.lock", ".github/workflows/export-filesystem.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: export-filesystem-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  filesystem:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Native filesystem contract
+        run: cargo test --locked --release -p effectcraft-export --lib pending::native::tests
+      - name: Export integration
+        run: cargo test --locked --release -p effectcraft-export --test render_settings

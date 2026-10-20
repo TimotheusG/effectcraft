@@ -35,6 +35,7 @@
 mod encode;
 mod hevc_av1;
 mod out;
+mod pending;
 mod pipeline;
 mod uncompressed;
 mod webm;
@@ -175,8 +176,17 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
     let t0 = Instant::now();
     let cx = Cx::new(job);
     let mut r = export_with(&cx, progress, t0).await;
+    if r.is_ok()
+        && let Err(error) = cx.pending.publish()
+    {
+        r = Err(error);
+    }
+    if let Err(original) = &r
+        && let Err(cleanup) = cx.pending.discard()
+    {
+        return Err(io(format!("{original}; cleanup also failed: {cleanup}")));
+    }
     if matches!(r, Err(ExportError::Cancelled)) {
-        cx.remove_cancelled_outputs()?;
         return r;
     }
     let log = cx.write_log(&r, t0.elapsed().as_secs_f64());
