@@ -364,3 +364,39 @@ fn a_cut_is_read_with_the_modifiers_where_it_is_in_the_frame() {
         assert_eq!(h.state().session.project.item(solid).is_none(), deletes, "case {n}: {events:?} after {before:?}");
     }
 }
+
+/// During a text edit, Edit ▸ Clear with the Project panel focused deletes the selected text,
+/// as it does from any other panel: the Project-panel redirect stands down, so the composition
+/// being typed into is not deleted out from under the edit, with no confirmation when nothing
+/// uses it (#2227). The menu item stays enabled for what it does there.
+#[test]
+fn clear_with_the_project_focused_deletes_the_selected_text_during_a_text_edit() {
+    let (mut h, _, _) = harness();
+    let working = h.state().session.active_comp_id().unwrap();
+    // the composition being typed into is also the Project panel's selection, as when it was opened
+    click(&mut h, &format!("project.item.{}.name", working.0), Modifiers::NONE);
+    let text = h.state_mut().session.execute("layer.newText", json!({"text": "Title", "size": 80})).unwrap()["layer"].as_u64().unwrap();
+    // The editor opens with all of "Title" selected; the caret then sits after "Tit".
+    h.state_mut().session.execute("text.edit", json!({"layer": text, "select": [3, 5]})).unwrap();
+    h.state_mut().ui.focused = PanelKind::Project;
+    h.run_steps(2);
+    assert!(h.state().session.state.project_selection.contains(&working), "the comp is the project selection");
+    let items: Vec<ItemId> = h.state().session.project.items.keys().copied().collect();
+    let enabled = |h: &Harness<'_, EffectcraftApp>| {
+        effectcraft_ui_egui::menus::menu_items(h.state()).into_iter().find(|m| m.id == "edit.clear").is_some_and(|m| m.enabled)
+    };
+    assert!(enabled(&h), "Clear is enabled for the selected text");
+
+    // Edit > Clear (the menu, or the control channel) dispatches through `invoke`
+    let ctx = h.ctx.clone();
+    let cleared = effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "edit.clear", json!({}));
+    h.run_steps(3);
+
+    cleared.expect("Clear deletes the selected text");
+    let s = &h.state().session;
+    assert!(s.project.item(working).is_some(), "the composition being typed into survives");
+    assert_eq!(s.project.items.keys().copied().collect::<Vec<_>>(), items, "no project item was deleted");
+    let doc = effectcraft_engine::commands::text_edit::layer_doc(s, LayerId(text)).map(|d| d.text);
+    assert_eq!(doc.as_deref(), Some("Tit"), "the selected characters are gone, the layer is kept");
+    assert!(s.state.text_edit.is_some(), "the text edit stays open");
+}

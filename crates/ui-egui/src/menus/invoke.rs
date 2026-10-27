@@ -195,9 +195,12 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     // The Project-panel focus redirects apply only while no text edit is open: creating a text
     // layer leaves focus on Project while the insertion point lives in the comp, so during an
     // edit these commands address the text context — redirected, Deselect All would clear a
-    // project selection the user is not looking at and silently swallow the edit's own end.
+    // project selection the user is not looking at and silently swallow the edit's own end, and
+    // Clear would delete the composition being typed into, without asking when nothing uses it.
     if no_params(&params) && app.ui.focused == PanelKind::Project && app.session.state.text_edit.is_none() {
         match id {
+            // Through `invoke`, so deleting items that compositions use still asks first (M3.16).
+            "edit.clear" => return invoke(app, ctx, "project.delete", json!({})),
             "edit.duplicate" => return run_engine(app, ctx, "project.duplicate", json!({})),
             "edit.selectAll" => {
                 let items: Vec<u64> = crate::panels::project::visible_rows(app)
@@ -224,10 +227,6 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
         }
     }
     // Clear follows panel focus, including the Edit menu and keyboard shortcut.
-    if id == "edit.clear" && params.as_object().is_some_and(|p| p.is_empty()) && app.ui.focused == PanelKind::Project {
-        // Through `invoke`, so deleting items that compositions use still asks first (M3.16).
-        return invoke(app, ctx, "project.delete", json!({}));
-    }
     if id == "edit.clear" && params.as_object().is_some_and(|p| p.is_empty()) && app.ui.focused == PanelKind::RenderQueue {
         let selected = ctx.data(|d| d.get_temp::<(Vec<u64>, Option<u64>)>(egui::Id::unique("rq-ui"))).and_then(|(_, id)| id);
         return match selected {

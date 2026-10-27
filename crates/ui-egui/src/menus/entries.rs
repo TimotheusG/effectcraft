@@ -106,6 +106,7 @@ pub(crate) fn entry_enabled(app: &EffectcraftApp, e: &MenuEntry) -> bool {
     // enabled by what their routed command can do, or the menu grays out commands that work.
     if app.ui.focused == PanelKind::Project && app.session.state.text_edit.is_none() {
         match e.command.as_str() {
+            "edit.clear" => return app.session.is_enabled("project.delete"),
             "edit.duplicate" => {
                 return !app.session.state.project_selection.is_empty()
                     && app.session.state.project_selection.iter().all(|id| app.session.project.item(*id).is_some_and(|i| !i.is_folder()));
@@ -117,9 +118,6 @@ pub(crate) fn entry_enabled(app: &EffectcraftApp, e: &MenuEntry) -> bool {
             }
             _ => {}
         }
-    }
-    if e.command == "edit.clear" && app.ui.focused == PanelKind::Project {
-        return app.session.is_enabled("project.delete");
     }
     if e.command == "edit.clear" && app.ui.focused == PanelKind::RenderQueue {
         return !app.session.is_rendering() && !app.session.project.render_queue.is_empty();
