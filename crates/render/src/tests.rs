@@ -988,6 +988,84 @@ fn shape_content_bounds_are_the_visual_edges() {
     }
 }
 
+/// A shape layer of contents groups made by `groups`, in a fresh 200×100 comp (its origin at the
+/// comp's centre).
+fn shape_layer_of(groups: impl FnOnce(&mut Ids) -> Vec<effectcraft_project::PropGroup>) -> (Project, ItemId, effectcraft_project::Layer) {
+    let (mut p, cid, comp) = setup();
+    let mut l = build::layer(&mut p, &comp, "Shape Layer 1", LayerSource::Shape, (200, 100), None);
+    let mut next = p.next_id;
+    let gs = groups(&mut Ids(&mut next));
+    p.next_id = next;
+    l.props.sub_mut("contents").unwrap().children.extend(gs.into_iter().map(Into::into));
+    p.comp_mut(cid).unwrap().layers.push(l.clone());
+    (p, cid, l)
+}
+
+fn bounds_of(p: &Project, cid: ItemId, l: &effectcraft_project::Layer) -> Option<[f64; 4]> {
+    crate::content_bounds(&crate::EvalCtx::new(p, cid, p.comp(cid).unwrap(), Tick::ZERO), l)
+}
+
+/// A shape layer's bounds cover only what it paints: a fill at zero opacity, one in a group at
+/// zero opacity, or a repeater copy at zero opacity draws nothing, so it must not widen the box
+/// that Fit to Comp, Align, snapping and the viewer handles use.
+#[test]
+fn shape_content_bounds_leave_out_paint_at_zero_opacity() {
+    for hidden_by in ["fill", "group", "repeater"] {
+        // A red 20×20 square at the origin on show, and a second one 60 px to its right hidden.
+        let (p, cid, l) = shape_layer_of(|ids| {
+            let red = |ids: &mut Ids| build::shape_fill(ids, [1.0, 0.0, 0.0, 1.0]);
+            let square = |ids: &mut Ids, x: f64| build::shape_rect(ids, [20.0, 20.0], [x, 0.0], 0.0);
+            if hidden_by == "repeater" {
+                // Two copies, the second at the repeater's End Opacity of 0%.
+                let mut rep = build::shape_repeater(ids, 2.0, [60.0, 0.0]);
+                rep.prop_mut("transform/endOpacity").unwrap().value = Value::Scalar(0.0);
+                let items = vec![square(ids, 0.0), red(ids), rep];
+                return vec![build::shape_group(ids, "Repeated", items)];
+            }
+            let shown = vec![square(ids, 0.0), red(ids)];
+            let shown = build::shape_group(ids, "Shown", shown);
+            let mut fill = red(ids);
+            if hidden_by == "fill" {
+                fill.get_mut("opacity").unwrap().value = Value::Scalar(0.0);
+            }
+            let hidden = vec![square(ids, 60.0), fill];
+            let mut hidden = build::shape_group(ids, "Hidden", hidden);
+            if hidden_by == "group" {
+                hidden.prop_mut("transform/opacity").unwrap().value = Value::Scalar(0.0);
+            }
+            vec![shown, hidden]
+        });
+        let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+        assert!(img.get(100, 50)[0] > 0.99, "{hidden_by}: the shown square renders");
+        assert_eq!(img.get(160, 50)[3], 0.0, "{hidden_by}: the renderer paints nothing for the hidden one");
+        let b = bounds_of(&p, cid, &l).unwrap();
+        assert!(b.iter().zip([-10.0, -10.0, 10.0, 10.0]).all(|(a, e)| (a - e).abs() < 1e-6), "{hidden_by}: only the shown square counts: {b:?}");
+    }
+}
+
+/// A shape layer that paints only at zero opacity (a fill fading in from 0%, at its first frame)
+/// keeps the box of its geometry, so it can still be selected, dragged and fitted.
+#[test]
+fn shape_content_bounds_of_a_shape_painted_only_at_zero_opacity_are_its_geometry() {
+    for hidden_by in ["fill", "group"] {
+        let (p, cid, l) = shape_layer_of(|ids| {
+            let mut fill = build::shape_fill(ids, [1.0, 0.0, 0.0, 1.0]);
+            if hidden_by == "fill" {
+                fill.get_mut("opacity").unwrap().value = Value::Scalar(0.0);
+            }
+            let items = vec![build::shape_rect(ids, [40.0, 30.0], [0.0, 0.0], 0.0), fill];
+            let mut g = build::shape_group(ids, "Fading", items);
+            if hidden_by == "group" {
+                g.prop_mut("transform/opacity").unwrap().value = Value::Scalar(0.0);
+            }
+            vec![g]
+        });
+        assert_eq!(render_frame(&p, cid, Tick::ZERO, 1.0).get(100, 50)[3], 0.0, "{hidden_by}: nothing renders");
+        let b = bounds_of(&p, cid, &l);
+        assert!(b.is_some_and(|b| b.iter().zip([-20.0, -15.0, 20.0, 15.0]).all(|(a, e)| (a - e).abs() < 1e-6)), "{hidden_by}: the rectangle's box: {b:?}");
+    }
+}
+
 /// Solo is not time-dependent (as in After Effects): while any layer is soloed, the others stay
 /// excluded even when the playhead is outside the soloed layer's in-out range.
 #[test]

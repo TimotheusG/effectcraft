@@ -1103,6 +1103,119 @@ fn transform_commands_keep_depth_and_follow_separated_dimensions() {
     assert_eq!(pos(&s, b)[..2], [200.0, 100.0], "the 200×100 solid's centre");
 }
 
+/// The layer's painted bounds mapped to comp space — what the viewer shows.
+fn seen_bounds(s: &Session, lid: u64) -> [f64; 4] {
+    let cid = s.active_comp_id().unwrap();
+    let comp = s.project.comp(cid).unwrap().clone();
+    let layer = comp.layer(effectcraft_project::LayerId(lid)).unwrap();
+    let ectx = effectcraft_render::EvalCtx::new(&s.project, cid, &comp, s.time());
+    let b = effectcraft_render::content_bounds(&ectx, layer).expect("painted bounds");
+    let m = ectx.layer_to_comp(layer).0;
+    let corners = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
+    let pts: Vec<[f64; 2]> = corners
+        .iter()
+        .map(|p| {
+            let q = m.apply(effectcraft_geom::vec2(p[0], p[1]));
+            [q.x, q.y]
+        })
+        .collect();
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for p in &pts {
+        x0 = x0.min(p[0]);
+        y0 = y0.min(p[1]);
+        x1 = x1.max(p[0]);
+        y1 = y1.max(p[1]);
+    }
+    [x0, y0, x1, y1]
+}
+
+#[test]
+fn fit_to_comp_fills_the_comp_with_shape_and_text_bounds() {
+    let mut s = comp();
+    let close = |x: f64, y: f64| (x - y).abs() < 1e-6;
+    // A shape or text layer has no source item: fit sizes it by its painted bounds, anchored at
+    // the bounds' centre, so what the viewer shows fills the frame (#2198).
+    let a = s.execute("layer.newShape", json!({"kind": "rect", "size": [180, 80]})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.transform", json!({"layers": [a], "op": "fit"})).unwrap();
+    let seen = seen_bounds(&s, a);
+    assert!(close(seen[0], 0.0) && close(seen[1], 0.0) && close(seen[2], 640.0) && close(seen[3], 360.0), "the rect's painted bounds fill the comp: {seen:?}");
+
+    let t = s.execute("layer.newText", json!({"text": "Title", "size": 80})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.transform", json!({"layers": [t], "op": "fit"})).unwrap();
+    let seen = seen_bounds(&s, t);
+    assert!(close(seen[0], 0.0) && close(seen[1], 0.0) && close(seen[2], 640.0) && close(seen[3], 360.0), "the text's painted bounds fill the comp: {seen:?}");
+
+    // fitWidth spans the comp's width and centres vertically. Fit already did both, so what shows
+    // fitWidth ran is the uniform scale it sets, which keeps the painted aspect ratio.
+    for lid in [a, t] {
+        s.execute("layer.transform", json!({"layers": [lid], "op": "fitWidth"})).unwrap();
+        let seen = seen_bounds(&s, lid);
+        assert!(close(seen[0], 0.0) && close(seen[2], 640.0), "fitWidth spans the comp width: {seen:?}");
+        assert!(close((seen[1] + seen[3]) / 2.0, 180.0), "fitWidth centres vertically: {seen:?}");
+        let scale = layer(&s, lid).transform().unwrap().get("scale").unwrap().value.as_vec3();
+        assert!(close(scale[0], scale[1]), "fitWidth scales both axes alike: {scale:?}");
+    }
+    let seen = seen_bounds(&s, a);
+    assert!(close(seen[3] - seen[1], 640.0 * 80.0 / 180.0), "the 180×80 rect keeps its aspect ratio: {seen:?}");
+}
+
+/// A shape layer of rectangles `(size, centre)` in layer space, painted with the default fill
+/// (`fillOpacity` %).
+fn rects_layer(s: &mut Session, rects: &[([f64; 2], [f64; 2], f64)]) -> u64 {
+    let l = s.execute("layer.newShape", json!({})).unwrap()["layer"].as_u64().unwrap();
+    for (size, at, opacity) in rects {
+        let p = json!({"layer": l, "kind": "rect", "size": size, "position": at, "space": "layer", "fillOpacity": opacity});
+        s.execute("shape.newShape", p).unwrap();
+    }
+    l
+}
+
+#[test]
+fn fit_to_comp_sizes_a_shape_by_the_paint_it_shows() {
+    let mut s = comp();
+    let close = |x: f64, y: f64| (x - y).abs() < 1e-6;
+    // A 180×80 rectangle on show, and one far from it whose fill is at zero opacity: the renderer
+    // draws nothing for that one, so it must not shrink the shown one inside the frame.
+    let a = rects_layer(&mut s, &[([180.0, 80.0], [0.0, 0.0], 100.0), ([40.0, 40.0], [280.0, 160.0], 0.0)]);
+    s.execute("layer.transform", json!({"layers": [a], "op": "fit"})).unwrap();
+    let tr = layer(&s, a).transform().unwrap().clone();
+    let scale = tr.get("scale").unwrap().value.as_vec3();
+    assert!(close(scale[0], 640.0 / 180.0 * 100.0) && close(scale[1], 360.0 / 80.0 * 100.0), "the shown rectangle fills the comp: {scale:?}");
+    let anchor = tr.get("anchor").unwrap().value.as_vec3();
+    assert!(close(anchor[0], 0.0) && close(anchor[1], 0.0), "anchored at the shown rectangle's centre: {anchor:?}");
+    // A shape painted only at zero opacity (a fill fading in, at its first frame) is still sized
+    // by its geometry.
+    let b = rects_layer(&mut s, &[([200.0, 120.0], [0.0, 0.0], 0.0)]);
+    s.execute("layer.transform", json!({"layers": [b], "op": "fit"})).unwrap();
+    let scale = layer(&s, b).transform().unwrap().get("scale").unwrap().value.as_vec3();
+    assert!(close(scale[0], 320.0) && close(scale[1], 300.0), "the transparent rectangle fills the comp: {scale:?}");
+}
+
+#[test]
+fn fit_to_comp_skips_painted_bounds_with_no_finite_fit() {
+    let mut s = comp();
+    let close = |x: f64, y: f64| (x - y).abs() < 1e-6;
+    // Each has painted bounds, but no transform within f64 fits them: so small that the scale
+    // overflows, so far out that the centre does, or so wide that the width does. Like a layer
+    // with empty bounds, each is left as it is, and the rest of the selection is still fitted.
+    let cases = [
+        ("tiny", rects_layer(&mut s, &[([1e-305, 1e-305], [0.0, 0.0], 100.0)])),
+        ("far", rects_layer(&mut s, &[([1e300, 1e300], [1.7e308, 0.0], 100.0)])),
+        ("wide", rects_layer(&mut s, &[([1.0, 1.0], [-1e308, 0.0], 100.0), ([1.0, 1.0], [1e308, 0.0], 100.0)])),
+    ];
+    let fits = rects_layer(&mut s, &[([180.0, 80.0], [0.0, 0.0], 100.0)]);
+    let before: Vec<_> = cases.iter().map(|(_, l)| layer(&s, *l).transform().unwrap().clone()).collect();
+    let all: Vec<u64> = cases.iter().map(|(_, l)| *l).chain([fits]).collect();
+    for op in ["fit", "fitWidth", "fitHeight"] {
+        s.execute("layer.transform", json!({"layers": all, "op": op})).unwrap();
+        for ((name, l), was) in cases.iter().zip(&before) {
+            assert_eq!(layer(&s, *l).transform().unwrap(), was, "{op}: the {name} layer is left as it was");
+        }
+    }
+    let scale = layer(&s, fits).transform().unwrap().get("scale").unwrap().value.as_vec3();
+    assert!(close(scale[0], 360.0 / 80.0 * 100.0) && close(scale[1], scale[0]), "fitHeight still fitted the other layer: {scale:?}");
+}
+
 #[test]
 fn duplicated_and_pasted_layers_keep_their_links() {
     let mut s = comp();

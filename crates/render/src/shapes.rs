@@ -430,6 +430,19 @@ fn collect(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, arena: &mut Vec<B
     (draws, live)
 }
 
+/// Whether a draw leaves any pixel: one at zero opacity (its own, its groups' or its repeater
+/// copy's) doesn't, so rendering, the outlines and [`content_bounds`] all skip it alike.
+fn paints(d: &Draw) -> bool {
+    d.opacity > 0.0
+}
+
+/// The draws of a shape layer's contents that [`paints`].
+fn painted(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, arena: &mut Vec<BezPath>) -> Vec<Draw> {
+    let (mut draws, _) = collect(ctx, layer, contents, arena);
+    draws.retain(paints);
+    draws
+}
+
 /// Gradient position of a point: linear along start→end, radial by distance from the start over
 /// the radius |end − start|. A radial Highlight shifts the focal point towards
 /// `highlight_length` % of the radius at `highlight_angle` from the start→end axis (a focal
@@ -593,12 +606,11 @@ const BATCH_PIXELS: usize = 8 << 20;
 /// consecutive draws are rasterised in parallel, then composited in stacking order.
 pub fn render(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, s: f64) -> Buf {
     let mut arena = Vec::new();
-    let (draws, _) = collect(ctx, layer, contents, &mut arena);
+    let draws = painted(ctx, layer, contents, &mut arena);
     // Bottom-most draw first.
     let resolved: Vec<(&Draw, Vec<BezPath>, kurbo::Rect)> = draws
         .iter()
         .rev()
-        .filter(|d| d.opacity > 0.0)
         .filter_map(|d| {
             let paths: Vec<BezPath> = d.slots.iter().map(|&i| arena[i].clone()).filter(|p| !p.elements().is_empty()).collect();
             let b = draw_bounds(d, &paths)?;
@@ -656,11 +668,9 @@ mod tests;
 /// fills: the colour half way along), without strokes (see [`extrusion_outlines`]).
 pub fn fill_outlines(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup) -> Vec<(Vec<BezPath>, [f32; 4])> {
     let mut arena = Vec::new();
-    let (draws, _) = collect(ctx, layer, contents, &mut arena);
-    draws
+    painted(ctx, layer, contents, &mut arena)
         .iter()
         .rev()
-        .filter(|d| d.opacity > 0.0)
         .filter_map(|d| {
             let c = match &d.paint {
                 Paint::Fill { color, .. } => *color,
@@ -679,11 +689,9 @@ pub fn fill_outlines(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup) -> Vec<
 /// with the colours of their extrusion's surfaces.
 pub fn extrusion_outlines(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup) -> Vec<(Vec<BezPath>, [f32; 4], SurfaceColors)> {
     let mut arena = Vec::new();
-    let (draws, _) = collect(ctx, layer, contents, &mut arena);
-    draws
+    painted(ctx, layer, contents, &mut arena)
         .iter()
         .rev()
-        .filter(|d| d.opacity > 0.0)
         .filter_map(|d| {
             let paths: Vec<BezPath> = d.slots.iter().map(|&i| arena[i].clone()).filter(|p| !p.elements().is_empty()).collect();
             if paths.is_empty() {
@@ -708,15 +716,22 @@ pub fn stroke_region(paths: &[BezPath], style: &StrokeStyle) -> Option<BezPath> 
 }
 
 /// Layer-space visual bounds of a shape layer's painted contents (half the stroke width
-/// included, no anti-aliasing padding), without rasterising.
+/// included, no anti-aliasing padding), without rasterising. Only draws that [`paints`] count,
+/// so an item hidden at zero opacity doesn't widen the box the viewer and Fit to Comp use. A
+/// layer that paints nothing at all (a fill fading in from 0%, at its first frame) has the bounds
+/// of every draw instead, so it can still be selected, dragged and fitted.
 pub fn content_bounds(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup) -> Option<kurbo::Rect> {
     let mut arena = Vec::new();
     let (draws, _) = collect(ctx, layer, contents, &mut arena);
-    draws
-        .iter()
-        .filter_map(|d| {
-            let paths: Vec<BezPath> = d.slots.iter().filter_map(|&i| arena.get(i).cloned()).filter(|p| !p.elements().is_empty()).collect();
-            visual_bounds(d, &paths)
-        })
-        .reduce(|a, b| a.union(b))
+    let bounds = |painting_only: bool| {
+        draws
+            .iter()
+            .filter(|d| !painting_only || paints(d))
+            .filter_map(|d| {
+                let paths: Vec<BezPath> = d.slots.iter().filter_map(|&i| arena.get(i).cloned()).filter(|p| !p.elements().is_empty()).collect();
+                visual_bounds(d, &paths)
+            })
+            .reduce(|a, b| a.union(b))
+    };
+    bounds(true).or_else(|| bounds(false))
 }

@@ -828,6 +828,26 @@ fn hidden_masked_layer_keeps_its_mask_path_editable() {
     assert_eq!(after.vertices[1..], before.vertices[1..]);
 }
 
+/// A shape painted only at zero opacity (a fill fading in, at its first frame) keeps the box of
+/// its geometry: a click inside it picks it over the layers below, and a drag moves it.
+#[test]
+fn a_shape_painted_only_at_zero_opacity_is_picked_and_dragged() {
+    let mut h = harness();
+    let s = &mut h.state_mut().session;
+    // 200×120 at the comp centre, above the Box and the full-frame Plate.
+    let shape = s.execute("layer.newShape", json!({"kind": "rect", "size": [200, 120], "fillOpacity": 0})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("edit.deselectAll", json!({})).unwrap();
+    s.execute("view.snapping", json!({"value": false})).unwrap();
+    h.run_steps(2);
+    // Inside the shape, outside the Box: only the Plate is below.
+    let (inside, right) = (screen(&h, [400.0, 200.0]), screen(&h, [450.0, 200.0]));
+    click(&mut h, inside);
+    assert_eq!(h.state().session.state.selected_layers, vec![LayerId(shape)], "the click picks the transparent shape");
+    drag(&mut h, inside, right);
+    let x = h.state().session.active_comp().unwrap().layer(LayerId(shape)).unwrap().props.prop("transform/position").unwrap().value.as_vec3()[0];
+    assert!((x - 370.0).abs() < 0.5, "the drag moves it 50 px: {x}");
+}
+
 #[test]
 fn path_tools_keep_bounds_on_layers_without_visible_paths() {
     let mut h = harness();
